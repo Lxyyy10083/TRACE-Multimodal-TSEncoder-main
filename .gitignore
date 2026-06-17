@@ -1,0 +1,29 @@
+# system files
+.DS_Store
+__MACOSX/
+
+# IDE files
+.idea/
+.vscode/
+
+# python cache
+__pycache__/
+*.pyc
+
+# logs and results
+logs/
+results/
+wandb/
+checkpoints/
+*.log
+
+# datasets / large files
+dataset/
+data/
+*.csv
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.safetensors

@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import io
 import torch
 from src.common import EVENT_MAP
+from src.data.time_prior_features import build_time_prior_features
 from tqdm import tqdm
 keys_to_save = ['temperature', 'precipitation', 'relative_humidity', 'visibility', 'wind_u', 'wind_v', 'sky_code']
 DATE_COLUMN_PRIORITY = ["date", "Date", "Month", "data", "start_date"]
@@ -213,5 +214,4 @@ def load_retrieval_from_parquet(split: str, file_path: str, text_encoder_name: s
         return timeseries, description_emb, channel_description_emb, event_emb, labels
     else:
         return timeseries, description_emb, channel_description_emb, event_emb, labels, descriptions, channel_descriptions, events
-
 

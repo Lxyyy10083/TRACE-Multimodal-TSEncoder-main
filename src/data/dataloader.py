@@ -34,13 +34,33 @@ def _collate_fn_forecasting(examples):
     input_masks = torch.stack(input_masks)  # [B, C, L]
     forecast = [torch.from_numpy(example.forecast) for example in examples] # [C, H]
     forecast = torch.stack(forecast)  # [B, C, H]
+    batch_kwargs = {
+        "timeseries": timeseries,
+        "input_mask": input_masks,
+        "forecast": forecast,
+    }
+
+    if examples[0].time_feat is not None:
+        time_feat = [torch.from_numpy(example.time_feat) for example in examples]
+        batch_kwargs["time_feat"] = torch.stack(time_feat)  # [B, T, D]
+
+    if examples[0].time_feat_weight is not None:
+        time_feat_weight = [
+            torch.from_numpy(example.time_feat_weight) for example in examples
+        ]
+        batch_kwargs["time_feat_weight"] = torch.stack(time_feat_weight)  # [B, T, D]
+
+    if examples[0].domain_id is not None:
+        domain_id = [int(np.asarray(example.domain_id).item()) for example in examples]
+        batch_kwargs["domain_id"] = torch.tensor(domain_id, dtype=torch.long)  # [B]
     
     if examples[0].prior_y is not None:
         prior_y = [torch.from_numpy(example.prior_y) for example in examples] # [C, H]
         prior_y = torch.stack(prior_y)  # [B, C, H]
-        return TimeseriesData(timeseries=timeseries, input_mask=input_masks, forecast=forecast, prior_y=prior_y)
+        batch_kwargs["prior_y"] = prior_y
+        return TimeseriesData(**batch_kwargs)
     else:
-        return TimeseriesData(timeseries=timeseries, input_mask=input_masks, forecast=forecast)
+        return TimeseriesData(**batch_kwargs)
 
 def _collate_fn_classification(examples):
     examples = list(filter(lambda x: x is not None, examples))

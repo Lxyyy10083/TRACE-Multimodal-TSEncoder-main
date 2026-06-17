@@ -14,6 +14,7 @@ from src.data.load_data import (
     load_forecasting_from_json,
     load_retrieval_from_parquet,
     normalize_csv_date_column,
+    build_time_prior_features,
 )
 from src.utils.data import (
     interpolate_timeseries,
@@ -510,6 +511,16 @@ class MMDataset(TaskDataset):
         file_path = os.path.join(self.root_path, self.data_path)
         df_raw = pd.read_csv(file_path)
         df_raw, self.date_col = normalize_csv_date_column(df_raw, file_path)
+        time_prior = build_time_prior_features(
+            df_raw,
+            data_name=self.data_name,
+            file_path=file_path,
+        )
+        self.domain_id = time_prior["domain_id"]
+        self.domain_name = time_prior["domain_name"]
+        self.time_granularity = time_prior["granularity"]
+        self.time_feat_names = time_prior["feature_names"]
+        self.time_focus_features = time_prior["focus_features"]
 
         required_cols = [self.target, "date", "prior_history_avg"]
         missing_cols = [col for col in required_cols if col not in df_raw.columns]
@@ -543,6 +554,8 @@ class MMDataset(TaskDataset):
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
         self.data_prior = data_prior[border1:border2]
+        self.time_feat = time_prior["time_feat"][border1:border2]
+        self.time_feat_weight = time_prior["time_feat_weight"][border1:border2]
 
         self.date=df_raw[['date']][border1:border2].values
         self.start_date=(
@@ -570,6 +583,16 @@ class MMDataset(TaskDataset):
             df_raw[[text_col]][border1:border2].values
             if text_col is not None else None
         )
+
+    def _get_window_with_front_padding(self, data, begin, end):
+        """Return a row window, padding zeros at the front when begin < 0."""
+        if begin >= 0:
+            return data[begin:end]
+
+        valid_part = data[0:end]
+        pad_shape = (abs(begin),) + data.shape[1:]
+        pad_part = np.zeros(pad_shape, dtype=data.dtype)
+        return np.concatenate([pad_part, valid_part], axis=0)
         
     def get_prior_y(self, indices):
         # If indices is a single integer index
@@ -624,12 +647,25 @@ class MMDataset(TaskDataset):
 
         input_mask = np.ones((1, self.seq_len))
         prior_y = self.get_prior_y(index).reshape(1, -1)
+        time_feat = self._get_window_with_front_padding(
+            self.time_feat,
+            r_begin,
+            r_end,
+        )
+        time_feat_weight = self._get_window_with_front_padding(
+            self.time_feat_weight,
+            r_begin,
+            r_end,
+        )
 
         return TimeseriesData(
             timeseries=seq_x,
             input_mask=input_mask,
             forecast=seq_y,
-            prior_y=prior_y
+            prior_y=prior_y,
+            time_feat=time_feat,
+            time_feat_weight=time_feat_weight,
+            domain_id=np.array(self.domain_id, dtype=np.int64),
         )
 
     def __len__(self):

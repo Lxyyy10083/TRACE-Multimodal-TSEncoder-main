@@ -22,6 +22,9 @@ class TimeseriesData:
     channel_descriptions: List[List[str]] = None
     events: List[List[str]] = None
     prior_y: npt.NDArray = None
+    time_feat: npt.NDArray = None
+    time_feat_weight: npt.NDArray = None
+    domain_id: Union[npt.NDArray, int] = None
 
 
 @dataclass

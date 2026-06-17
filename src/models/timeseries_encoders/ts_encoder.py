@@ -10,7 +10,7 @@ from src.utils.tools import NamespaceWithDefaults, MultiHeadWrapper
 
 from src.models.layers.embed import TimeEmbedding
 from src.models.layers.revin import RevIN
-from src.models.layers.prediction_head import ClassificationHead, ForecastingHead, ReconstructionHead, EmbeddingHead, RetrievalAugmentedHead
+from src.models.layers.prediction_head import ForecastingHead, ReconstructionHead, EmbeddingHead, RetrievalAugmentedHead
 from src.models.layers.get_encoder import get_transformer_backbone
 
 class TS_Encoder(nn.Module):
@@ -102,13 +102,6 @@ class TS_Encoder(nn.Module):
                         self.configs.patch_len,
                         self.configs.getattr("dropout", 0.1),
                         self.configs.getattr("orth_gain", 1.41),
-                    ),
-                    "classification_head": ClassificationHead(
-                        self.configs.n_channels,
-                        self.configs.d_model,
-                        self.configs.num_class,
-                        self.configs.getattr("dropout", 0.1),
-                        self.configs.getattr("view", "global"),
                     )
                 })
             elif task_name == TASKS.RECONSTRUCTION:
@@ -117,14 +110,6 @@ class TS_Encoder(nn.Module):
                     self.configs.patch_len,
                     self.configs.getattr("dropout", 0.1),
                     self.configs.getattr("orth_gain", 1.41),
-                )
-            elif task_name == TASKS.CLASSIFICATION:
-                return ClassificationHead(
-                    self.configs.n_channels,
-                    self.configs.d_model,
-                    self.configs.num_class,
-                    self.configs.getattr("dropout", 0.1),
-                    self.configs.getattr("view", "global"),
                 )
             elif task_name == TASKS.FORECASTING:
                 return ForecastingHead(
@@ -178,7 +163,13 @@ class TS_Encoder(nn.Module):
         # [B, total_len, d_model] or [B, C, N, d_model]
 
         # Encoder
-        attention_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)  #[B, C, N]
+        # In forecasting, if input_mask is all ones, there is no padding/missing value to mask.
+        # Skip passing it into attention to avoid special-token length mismatch.
+        if input_mask is not None and torch.all(input_mask == 1):
+            attention_mask = None
+        else:
+            attention_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)  #[B, C, N]
+
         enc_out, attns = self.encoder(
             x=enc_in,
             attn_mask=attention_mask,
@@ -202,7 +193,13 @@ class TS_Encoder(nn.Module):
             Input mask for the time-series data that is unobserved.
             This is typically padded data, that is not attended to.
         """
-        pretrain_mask = torch.ones_like(input_mask)
+        if input_mask is None:
+            pretrain_mask = torch.ones_like(x_enc)
+        else:
+            if input_mask is None:
+                pretrain_mask = torch.ones_like(x_enc)
+            else:
+                pretrain_mask = torch.ones_like(input_mask)
         enc_out, attns = self._get_encoding_out(x_enc, pretrain_mask, input_mask)
 
         # Decoder
@@ -238,9 +235,7 @@ class TS_Encoder(nn.Module):
         enc_out, attns = self._get_encoding_out(x_enc, pretrain_mask, input_mask)
 
         # Decoder
-        input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         dec_out = self.head["reconstruct_head"](enc_out, shape=self.dec_shape)  # [B, C, L]
-        class_out = self.head["classification_head"](enc_out, input_mask_patch_view, shape=self.dec_shape)  # [B, n_classes]
         # De-Normalization
         dec_out = self.normalizer(x=dec_out, mode="denorm")
         illegal_output = (
@@ -253,7 +248,6 @@ class TS_Encoder(nn.Module):
                 input_mask=input_mask,  # [B, C, L]
                 reconstruction=dec_out,  # [B, C, L]
                 pretrain_mask=pretrain_mask,  # [B, C, L]
-                classification=class_out,  # [B, n_classes]
                 illegal_output=illegal_output  # None or True
             ), attns
         else:
@@ -261,7 +255,6 @@ class TS_Encoder(nn.Module):
                 input_mask=input_mask,  # [B, C, L]
                 reconstruction=dec_out,  # [B, C, L]
                 pretrain_mask=pretrain_mask,  # [B, C, L]
-                classification=class_out,  # [B, n_classes]
                 illegal_output=illegal_output  # None or True
             )
 
@@ -313,6 +306,8 @@ class TS_Encoder(nn.Module):
             Input mask for the time-series data that is unobserved.
             This is typically padded data, that is not attended to.
         """
+        if input_mask is None:
+            input_mask = torch.ones_like(x_enc)
         pretrain_mask = torch.ones_like(input_mask)
         enc_out, attns = self._get_encoding_out(x_enc, pretrain_mask, input_mask)
 
@@ -326,31 +321,6 @@ class TS_Encoder(nn.Module):
             input_mask=input_mask,
             forecast=dec_out)
 
-    def classification(
-        self, x_enc: torch.Tensor,
-        input_mask: torch.Tensor = None,
-        **kwargs
-    ):
-        """
-        x_enc : [B, C, L] Time-series data
-        input_mask : [B, C, L]
-            Input mask for the time-series data that is unobserved.
-            This is typically padded data, that is not attended to.
-        """
-        pretrain_mask = torch.ones_like(input_mask)
-        enc_out, attns = self._get_encoding_out(x_enc, pretrain_mask, input_mask)
-
-        # Decoder
-        input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len) # [B, C, N]
-        dec_out = self.head(enc_out, input_mask_patch_view, shape=self.dec_shape) # [B, n_classes]
-        # De-Normalization
-        dec_out = self.normalizer(x=dec_out, mode="denorm")  #[B,n_classes]
-
-        return TimeseriesOutputs(
-            input_mask=input_mask,
-            classification=dec_out,
-            )
-
     def rag_forecasting(
         self, x_enc: torch.Tensor,
         input_mask: torch.Tensor = None,
@@ -362,6 +332,8 @@ class TS_Encoder(nn.Module):
             Input mask for the time-series data that is unobserved.
             This is typically padded data, that is not attended to.
         """
+        if input_mask is None:
+            input_mask = torch.ones_like(x_enc)
         pretrain_mask = torch.ones_like(input_mask)
         enc_out, attns = self._get_encoding_out(x_enc, pretrain_mask, input_mask)
         soft_prompt = self.retriever(x_enc, input_mask, top_k=self.top_k)
@@ -390,12 +362,10 @@ class TS_Encoder(nn.Module):
         if hasattr(self.configs, "data_name") and self.configs.data_name in ["health", "env", "energy"]:
             return self.timemmd_pretraining(x_enc=x_enc, pretrain_mask=pretrain_mask, input_mask=input_mask, **kwargs)
         else:
-            if self.task_name == TASKS.PRETRAINING:  #[reconstruction + global classification]
+            if self.task_name == TASKS.PRETRAINING:
                 return self.pretraining(x_enc=x_enc, pretrain_mask=pretrain_mask, input_mask=input_mask, **kwargs)
             elif self.task_name == TASKS.FORECASTING:
                 return self.forecast(x_enc=x_enc, input_mask=input_mask, **kwargs)
-            elif self.task_name == TASKS.CLASSIFICATION:
-                return self.classification(x_enc=x_enc, input_mask=input_mask, **kwargs)
             elif self.task_name == TASKS.EMBEDDING:
                 return self.embed(x_enc=x_enc, input_mask=input_mask, **kwargs)
             elif self.task_name == TASKS.RAG:
@@ -427,4 +397,3 @@ class TS_Encoder(nn.Module):
             or illegal_head_weights
             or illegal_patch_embedding_weights
         )
-

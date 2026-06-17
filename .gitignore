@@ -18,8 +18,8 @@ checkpoints/
 *.log
 
 # datasets / large files
-dataset/
-data/
+/dataset/
+/data/
 *.csv
 *.npy
 *.npz

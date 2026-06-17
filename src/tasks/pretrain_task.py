@@ -7,8 +7,6 @@ import torch.nn as nn
 from tqdm import tqdm
 from wandb import AlertLevel
 from src.utils.tools import MetricsStore, dtype_map, make_dir_if_not_exists, count_parameters
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
-from src.utils.tools import gather_all_tensor_with_padding
 from .base import Tasks
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
@@ -24,15 +22,13 @@ class Pretraining(Tasks):
         count_parameters(self.model)
 
     def validation(self, data_loader, return_preds: bool = False, split: str = "val"):
-        all_preds, all_valid_labels = [], []
-        loss = {"forecast_losses": [], "classification_losses": [], "total_losses": []}
+        loss = {"forecast_losses": [], "total_losses": []}
 
         self.model.eval()
         with torch.no_grad():
             for batch_x in tqdm(data_loader, total=len(data_loader)):
                 timeseries = batch_x.timeseries.float().to(self.device) #[B, C, L]
                 input_mask = batch_x.input_mask.long().to(self.device) #[B, C, L]
-                labels = torch.tensor(batch_x.labels, dtype=torch.long).reshape(-1).to(self.device)
 
                 with torch.autocast(
                     device_type="cuda",
@@ -48,58 +44,22 @@ class Pretraining(Tasks):
                 observed_mask = input_mask * (1 - outputs.pretrain_mask)  #[B, C, L]
                 masked_loss = observed_mask * recon_loss
                 forecast_loss = masked_loss.nansum() / (observed_mask.nansum() + 1e-7)
-                preds = outputs.classification.argmax(dim=1)
-
-                # Support -100 padding
-                valid_mask = labels != -100
-                all_preds.append(preds[valid_mask])
-                all_valid_labels.append(labels[valid_mask])
-
-                labeled_mask =(labels != -100)
-                if labeled_mask.any():
-                    classification_loss = self.classification_criterion(outputs.classification, labels)  #[B, n_classes]
-                    total_loss = forecast_loss + self.args.beta * classification_loss
-                else:
-                    classification_loss = torch.tensor(0.0, device=outputs.classification.device)
-                    total_loss = forecast_loss
+                total_loss = forecast_loss
 
                 #### get metrics from all GPUs #####
                 if self.args.world_size > 1:
-                    tensor_forecast_loss = torch.tensor(forecast_loss, device=self.device)
+                    tensor_forecast_loss = forecast_loss.detach().clone()
                     dist.all_reduce(tensor_forecast_loss, op=dist.ReduceOp.SUM)
                     forecast_loss = (tensor_forecast_loss / self.args.world_size)
-
-                    tensor_classification_loss = torch.tensor(classification_loss, device=self.device)
-                    dist.all_reduce(tensor_classification_loss, op=dist.ReduceOp.SUM)
-                    classification_loss = (tensor_classification_loss / self.args.world_size)
-
-                    total_loss = forecast_loss + self.args.beta * classification_loss
+                    total_loss = forecast_loss
 
 
                 loss["forecast_losses"].append(forecast_loss.item())
-                loss["classification_losses"].append(classification_loss.item())
                 loss["total_losses"].append(total_loss.item())
-
-        all_preds = gather_all_tensor_with_padding(torch.cat(all_preds, dim=0))
-        all_valid_labels = gather_all_tensor_with_padding(torch.cat(all_valid_labels, dim=0))
-        all_preds_np = all_preds.cpu().numpy()
-        all_valid_labels_np = all_valid_labels.cpu().numpy()
-        if self.args.rank == 0:
-            accuracy = accuracy_score(all_valid_labels_np, all_preds_np)
-            precision = precision_score(all_valid_labels_np, all_preds_np, average="macro", zero_division=0)
-            recall = recall_score(all_valid_labels_np, all_preds_np, average="macro", zero_division=0)
-            f1 = f1_score(all_valid_labels_np, all_preds_np, average="macro", zero_division=0)
-            self.logger.log({
-                f"{split}_accuracy": accuracy,
-                f"{split}_precision": precision,
-                f"{split}_recall": recall,
-                f"{split}_f1": f1
-            })
 
         average_total_loss = np.average(np.array(loss["total_losses"]))
         average_forecast_loss = np.average(np.array(loss["forecast_losses"]))
-        average_classification_loss = np.average(np.array(loss["classification_losses"]))
-        average_losses = {f"{split}_total_loss": average_total_loss, f"{split}_recon_loss": average_forecast_loss, f"{split}_classification_loss": average_classification_loss}
+        average_losses = {f"{split}_total_loss": average_total_loss, f"{split}_recon_loss": average_forecast_loss}
         self.model.train()
         return average_losses
 
@@ -111,11 +71,16 @@ class Pretraining(Tasks):
 
         self.optimizer = self._select_optimizer()
         self.forecast_criterion = self._select_criterion()
-        self.classification_criterion = nn.CrossEntropyLoss()
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
         self._init_lr_scheduler()
-        self.model.to(self.args.rank)
-        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.args.rank], find_unused_parameters=True )
+        self.model.to(self.device)
+
+        if self.args.distributed and self.args.world_size > 1:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.args.rank],
+                find_unused_parameters=True
+            )
         self.early_stopping = EarlyStopping(patience=self.args.patience, delta=self.args.delta)
         # self.evaluate_model()
 
@@ -149,15 +114,13 @@ class Pretraining(Tasks):
                 observed_mask = input_mask * (1 - outputs.pretrain_mask)  #[B, C, L]
                 masked_loss = observed_mask * recon_loss  #[B, C, L]
                 recon_loss = masked_loss.nansum() / (observed_mask.nansum() + 1e-7)  #[B, C, L]
-
-
+                total_loss = recon_loss
 
                 if self.args.rank == 0:
                     self.logger.log(
                         {
                             "train_total_loss": total_loss.item(),
                             "train_recon_loss": recon_loss.item(),
-                            "train_classification_loss": classification_loss.item(),
                             "learning_rate": self.optimizer.param_groups[0]["lr"],
                     }
                 )
@@ -211,4 +174,3 @@ class Pretraining(Tasks):
             self.logger.log(eval_metrics.val_loss)
             self.logger.log(eval_metrics.test_loss)
         return eval_metrics
-

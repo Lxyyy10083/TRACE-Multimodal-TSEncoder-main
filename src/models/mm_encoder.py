@@ -1,4 +1,5 @@
 from argparse import Namespace
+from copy import deepcopy
 import torch
 from torch import nn
 
@@ -17,6 +18,54 @@ from src.models.layers.prediction_head import (
     RetrievalAugmentedHead
 )
 from src.models.layers.get_encoder import get_transformer_backbone
+from src.models.timeseries_encoders.ts_encoder import TS_Encoder as TimeSeriesEncoder
+
+
+def _infer_text_embedding_dim(text_encoder_name: str, default_dim: int = 768):
+    """Infer common precomputed text embedding dimensions without loading models."""
+    model_dimensions = {
+        "sentence-transformers/all-MiniLM-L6-v2": 384,
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
+        "sentence-transformers/all-mpnet-base-v2": 768,
+        "bert-base-uncased": 768,
+        "bert-large-uncased": 1024,
+        "roberta-base": 768,
+        "roberta-large": 1024,
+        "nomic-ai/nomic-embed-text-v1": 768,
+        "nomic-ai/nomic-embed-text-v1.5": 768,
+    }
+    return model_dimensions.get(text_encoder_name, default_dim)
+
+
+class PriorLogitScorer(nn.Module):
+    """Score pairwise compatibility between temporal priors and text embeddings."""
+
+    def __init__(self, d_model: int, hidden_dim: int = None, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = hidden_dim or d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, prior_emb, text_emb):
+        """
+        Args:
+            prior_emb: [B, d_model]
+            text_emb: [N, d_model]
+
+        Returns:
+            prior_logits: [B, N]
+        """
+        bsz, dim = prior_emb.shape
+        num_text = text_emb.shape[0]
+        prior_i = prior_emb.unsqueeze(1).expand(bsz, num_text, dim)
+        text_j = text_emb.unsqueeze(0).expand(bsz, num_text, dim)
+        pair_feat = torch.cat([prior_i, text_j, prior_i * text_j], dim=-1)
+        return self.mlp(pair_feat).squeeze(-1)
 
 
 class TS_Encoder(nn.Module):
@@ -220,3 +269,123 @@ class TS_Encoder(nn.Module):
 
         else:
             raise NotImplementedError(self.task_name)
+
+
+class MultiModalEncoder(nn.Module):
+    """
+    Minimal multimodal wrapper used by context alignment.
+
+    The time-series branch is the real TRACE TS_Encoder in embedding mode. When
+    temporal prior inputs are provided, they are passed into that branch and are
+    added to the CLS representation inside TS_Encoder.
+    """
+
+    def __init__(self, configs: Namespace | dict):
+        super().__init__()
+        if isinstance(configs, dict):
+            configs = NamespaceWithDefaults(**configs)
+        else:
+            configs = NamespaceWithDefaults.from_namespace(configs)
+        self.configs = configs
+        ts_configs = deepcopy(configs)
+        ts_configs.task_name = TASKS.EMBEDDING
+        self.ts_encoder = TimeSeriesEncoder(configs=ts_configs)
+        text_dim = _infer_text_embedding_dim(
+            configs.getattr("text_encoder_name", "bert-base-uncased")
+        )
+        self.text_projection = nn.Linear(text_dim, configs.d_model)
+        self.channel_text_projection = nn.Linear(text_dim, configs.d_model)
+        self.event_projection = nn.Linear(text_dim, configs.d_model)
+        self.classification_head = nn.Linear(
+            configs.d_model,
+            configs.getattr("num_class", 9),
+        )
+        self.use_prior_calibrated_logits = configs.getattr(
+            "use_prior_calibrated_logits",
+            False,
+        )
+        self.prior_beta = configs.getattr("prior_beta", 0.1)
+        self.prior_scorer = PriorLogitScorer(
+            d_model=configs.d_model,
+            hidden_dim=configs.getattr("prior_hidden_dim", None),
+            dropout=configs.getattr("prior_dropout", configs.getattr("dropout", 0.1)),
+        )
+        self._logged_prior_logits = False
+
+    def prior_calibrated_logits(self, ts_emb, text_emb, prior_emb=None, tau=0.07):
+        """
+        Combine semantic similarity logits with temporal-prior calibration.
+
+        sim_logits are the original TRACE likelihood term. prior_logits are a
+        learnable temporal prior term conditioned on prior_emb and each text
+        embedding. The sum forms the posterior matching distribution logits.
+        """
+        sim_logits = torch.matmul(ts_emb, text_emb.T) / tau
+        if (
+            not self.use_prior_calibrated_logits
+            or prior_emb is None
+        ):
+            return sim_logits
+
+        prior_logits = self.prior_scorer(prior_emb, text_emb)
+        posterior_logits = sim_logits + self.prior_beta * prior_logits
+        if not self._logged_prior_logits:
+            print(
+                "[MultiModalEncoder] prior-calibrated logits: "
+                f"sim_logits.shape={sim_logits.shape}, "
+                f"prior_logits.shape={prior_logits.shape}, "
+                f"posterior_logits.shape={posterior_logits.shape}, "
+                f"prior_beta={self.prior_beta}, "
+                f"use_prior_calibrated_logits={self.use_prior_calibrated_logits}"
+            )
+            self._logged_prior_logits = True
+        return posterior_logits
+
+    def forward(
+        self,
+        x_enc,
+        input_mask=None,
+        channel_description_emb=None,
+        description_emb=None,
+        event_emb=None,
+        time_feat=None,
+        time_feat_weight=None,
+        domain_id=None,
+        **kwargs,
+    ):
+        ts_outputs = self.ts_encoder(
+            x_enc=x_enc,
+            input_mask=input_mask,
+            time_feat=time_feat,
+            time_feat_weight=time_feat_weight,
+            domain_id=domain_id,
+            **kwargs,
+        )
+
+        if description_emb is not None:
+            description_emb = self.text_projection(description_emb)
+        if channel_description_emb is not None:
+            channel_description_emb = self.channel_text_projection(channel_description_emb)
+        if event_emb is not None:
+            event_emb = self.event_projection(event_emb)
+
+        classification = self.classification_head(ts_outputs.embeddings)
+        return TimeseriesOutputs(
+            input_mask=input_mask,
+            reconstruction=ts_outputs.reconstruction,
+            embeddings=ts_outputs.embeddings,
+            channel_embeddings=ts_outputs.channel_embeddings,
+            cls_embedding=ts_outputs.cls_embedding,
+            classification=classification,
+            description_emb=description_emb,
+            channel_description_emb=channel_description_emb,
+            event_emb=event_emb,
+            prior_emb=ts_outputs.prior_emb,
+        )
+
+    def get_ts_embedding(self, x_enc, input_mask=None, **kwargs):
+        return self.ts_encoder(
+            x_enc=x_enc,
+            input_mask=input_mask,
+            **kwargs,
+        )

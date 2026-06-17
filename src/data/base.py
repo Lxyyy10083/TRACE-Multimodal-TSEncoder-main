@@ -18,6 +18,7 @@ class TimeseriesData:
     description_emb: torch.Tensor = None
     event_emb: torch.Tensor = None
     channel_description_emb: torch.Tensor = None
+    prior_emb: torch.Tensor = None
     descriptions: List[str] = None
     channel_descriptions: List[List[str]] = None
     events: List[List[str]] = None
@@ -43,6 +44,7 @@ class TimeseriesOutputs:
     description_emb: torch.Tensor = None
     event_emb: torch.Tensor = None
     channel_description_emb: torch.Tensor = None
+    prior_emb: torch.Tensor = None
 
 
 

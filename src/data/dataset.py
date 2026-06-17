@@ -481,6 +481,7 @@ class MMDataset(TaskDataset):
         self.scale = scale
         self.data_name = data_name
         self.root_path, self.data_path = self._resolve_csv_path(root_path, data_name)
+        self._logged_time_prior_sample = False
         self.__read_data__()
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
 
@@ -657,6 +658,25 @@ class MMDataset(TaskDataset):
             r_begin,
             r_end,
         )
+        expected_time_len = self.label_len + self.pred_len
+        assert time_feat.ndim == 2, f"time_feat must be [T, D], got {time_feat.shape}"
+        assert time_feat_weight.shape == time_feat.shape, (
+            "time_feat_weight must match time_feat shape, "
+            f"got {time_feat_weight.shape} vs {time_feat.shape}"
+        )
+        assert time_feat.shape[0] == expected_time_len, (
+            f"time_feat length must be label_len + pred_len={expected_time_len}, "
+            f"got {time_feat.shape[0]}"
+        )
+        assert isinstance(self.domain_id, (int, np.integer)), (
+            f"domain_id must be an integer, got {type(self.domain_id)}"
+        )
+        if not self._logged_time_prior_sample:
+            print(
+                "[MMDataset] time prior sample ready: "
+                f"time_feat_shape={time_feat.shape}, domain_id={int(self.domain_id)}"
+            )
+            self._logged_time_prior_sample = True
 
         return TimeseriesData(
             timeseries=seq_x,

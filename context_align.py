@@ -7,6 +7,12 @@ from src.common import PATHS
 from src.tasks.context_align_task import ContextAligning
 from src.utils.config import Config
 from src.utils.tools import control_randomness, make_dir_if_not_exists, parse_config
+from src.utils.time_prior_config import (
+    add_time_prior_args,
+    apply_time_prior_overrides,
+    print_time_prior_summary,
+    resolve_time_prior_config,
+)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 NOTES = "Aligning"
@@ -33,6 +39,7 @@ def main_worker():
     parser.add_argument("--num_negatives", type=int, default=10)
     parser.add_argument('--hard_negative_mining', action='store_true', default=False)
     parser.add_argument("--cross_attend", action='store_true', default=False)
+    add_time_prior_args(parser)
     args_cmd = parser.parse_args()
 
     # ========== Config & Reproducibility ==========
@@ -49,6 +56,7 @@ def main_worker():
     config["distributed"] = True
     config["checkpoint_path"] = PATHS.CHECKPOINTS_DIR + "context_align/"
     config["result_dir"] = PATHS.RESULTS_DIR + "context_align/"
+    apply_time_prior_overrides(config, args_cmd)
     make_dir_if_not_exists(config["checkpoint_path"])
 
     args = parse_config(config)
@@ -62,7 +70,9 @@ def main_worker():
     args.num_negatives = args_cmd.num_negatives
     args.hard_negative_mining = args_cmd.hard_negative_mining
     args.cross_attend = args_cmd.cross_attend
+    args = resolve_time_prior_config(args)
     if global_rank == 0:
+        print_time_prior_summary(args)
         print(f"[Rank {global_rank}] Running with config:\n{args}\n")
 
     # ========== Main Training ==========

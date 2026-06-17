@@ -35,7 +35,73 @@ class ContextAligning(Tasks):
         self.args = args
         self.model = MultiModalEncoder(args)
         self.num_negatives = args.num_negatives
+        self._logged_time_prior_batch = False
 
+    def _unpack_batch_with_time_prior(self, batch):
+        """Support both TimeseriesData batches and tuple batches with time priors."""
+        if isinstance(batch, (tuple, list)):
+            if len(batch) >= 6:
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = batch[:6]
+            elif len(batch) >= 5:
+                batch_x, batch_y, text, time_feat, domain_id = batch[:5]
+                time_feat_weight = None
+            elif len(batch) == 3:
+                batch_x, batch_y, text = batch
+                time_feat, time_feat_weight, domain_id = None, None, None
+            elif len(batch) == 2:
+                batch_x, batch_y = batch
+                text, time_feat, time_feat_weight, domain_id = None, None, None, None
+            else:
+                batch_x = batch[0]
+                batch_y, text, time_feat, time_feat_weight, domain_id = None, None, None, None, None
+            return batch_x, batch_y, text, time_feat, time_feat_weight, domain_id
+
+        return (
+            batch,
+            getattr(batch, "forecast", None),
+            getattr(batch, "descriptions", None),
+            getattr(batch, "time_feat", None),
+            getattr(batch, "time_feat_weight", None),
+            getattr(batch, "domain_id", None),
+        )
+
+    def _move_time_prior_to_device(self, time_feat, time_feat_weight, domain_id):
+        """Move optional time prior tensors to the active training device."""
+        if time_feat is not None:
+            if not torch.is_tensor(time_feat):
+                time_feat = torch.as_tensor(time_feat)
+            time_feat = time_feat.to(self.device)
+        if time_feat_weight is not None:
+            if not torch.is_tensor(time_feat_weight):
+                time_feat_weight = torch.as_tensor(time_feat_weight)
+            time_feat_weight = time_feat_weight.to(self.device)
+        if domain_id is not None:
+            if not torch.is_tensor(domain_id):
+                domain_id = torch.as_tensor(domain_id, dtype=torch.long)
+            domain_id = domain_id.to(self.device)
+        return time_feat, time_feat_weight, domain_id
+
+    def _log_time_prior_batch_once(self, batch_x, time_feat, domain_id):
+        if self._logged_time_prior_batch or time_feat is None or domain_id is None:
+            return
+        batch_x_shape = (
+            batch_x.timeseries.shape if hasattr(batch_x, "timeseries") else batch_x.shape
+        )
+        print(
+            "[ContextAligning] time prior batch: "
+            f"batch_x.shape={batch_x_shape}, "
+            f"time_feat.shape={time_feat.shape}, "
+            f"domain_id.shape={domain_id.shape}"
+        )
+        self._logged_time_prior_batch = True
+
+    def _prior_calibrated_logits(self, ts_emb, text_emb, prior_emb=None, tau=0.07):
+        """Return posterior logits: semantic similarity plus temporal prior."""
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model, "prior_calibrated_logits"):
+            return model.prior_calibrated_logits(ts_emb, text_emb, prior_emb, tau=tau)
+        return torch.matmul(ts_emb, text_emb.T) / tau
+    
     
     def compute_retrieval_metrics(self,
                                   query_embeddings, 
@@ -169,13 +235,16 @@ class ContextAligning(Tasks):
         all_preds, all_valid_labels = [], []
         self.model.eval()
         with torch.no_grad():
-            for batch_x in tqdm(self.test_dataloader, total=len(self.test_dataloader)):
+            for batch in tqdm(self.test_dataloader, total=len(self.test_dataloader)):
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = self._unpack_batch_with_time_prior(batch)
                 timeseries = batch_x.timeseries.float().to(self.device) if self.args.model_name.lower() not in ["chronos"] else batch_x.timeseries.float() #[B, C, L]
                 input_mask = batch_x.input_mask.long().to(self.device)  #[B, C, L]
                 labels = torch.tensor(batch_x.labels, dtype=torch.long).reshape(-1).to(self.device)  #[B]
                 channel_description_emb = batch_x.channel_description_emb.to(self.device)  #[B, C, d]
                 description_emb = batch_x.description_emb.to(self.device)  #[B, d]
                 event_emb = batch_x.event_emb.to(self.device)  #[B, d]
+                time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
+                self._log_time_prior_batch_once(batch_x, time_feat, domain_id)
                 raw_description = batch_x.descriptions  # list of strings
                 raw_event = batch_x.events # list of strings
                 if not self.args.set_input_mask:
@@ -186,7 +255,16 @@ class ContextAligning(Tasks):
                     dtype=dtype_map(self.args.torch_dtype),
                     enabled=self.args.use_amp,
                 ):
-                    outputs = self.model(x_enc=timeseries, input_mask=input_mask, channel_description_emb=channel_description_emb, description_emb=description_emb, event_emb=event_emb)
+                    outputs = self.model(
+                        x_enc=timeseries,
+                        input_mask=input_mask,
+                        channel_description_emb=channel_description_emb,
+                        description_emb=description_emb,
+                        event_emb=event_emb,
+                        time_feat=time_feat,
+                        time_feat_weight=time_feat_weight,
+                        domain_id=domain_id,
+                    )
                     
                 del input_mask, channel_description_emb, description_emb, event_emb
                 torch.cuda.empty_cache()
@@ -266,7 +344,8 @@ class ContextAligning(Tasks):
             if self.args.distributed and isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(cur_epoch)
                 
-            for batch_x in tqdm(self.train_dataloader, total=len(self.train_dataloader)):
+            for batch in tqdm(self.train_dataloader, total=len(self.train_dataloader)):
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = self._unpack_batch_with_time_prior(batch)
                 self.optimizer.zero_grad(set_to_none=True)
                 timeseries = batch_x.timeseries.float().to(self.device) if self.args.model_name.lower() not in ["chronos"] else batch_x.timeseries.float().to("cpu") #[B, C, L]
                 input_mask = batch_x.input_mask.long().to(self.device)  #[B, C, L]
@@ -274,6 +353,8 @@ class ContextAligning(Tasks):
                 channel_description_emb = batch_x.channel_description_emb.to(self.device) #[B, C, d]
                 description_emb = batch_x.description_emb.to(self.device)  #[B, d]
                 event_emb = batch_x.event_emb.to(self.device)  #[B, d]
+                time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
+                self._log_time_prior_batch_once(batch_x, time_feat, domain_id)
                 if not self.args.set_input_mask:
                     input_mask = torch.ones_like(input_mask)
 
@@ -282,7 +363,16 @@ class ContextAligning(Tasks):
                     dtype=dtype_map(self.args.torch_dtype),
                     enabled=self.args.use_amp,
                 ):
-                    outputs = self.model(x_enc=timeseries, input_mask=input_mask, channel_description_emb=channel_description_emb, description_emb=description_emb, event_emb=event_emb)
+                    outputs = self.model(
+                        x_enc=timeseries,
+                        input_mask=input_mask,
+                        channel_description_emb=channel_description_emb,
+                        description_emb=description_emb,
+                        event_emb=event_emb,
+                        time_feat=time_feat,
+                        time_feat_weight=time_feat_weight,
+                        domain_id=domain_id,
+                    )
 
                 
                 if hasattr(self.args, "model_name") and self.args.model_name.lower() in ["moment", "time-moe", "timer", "chronos"]:
@@ -335,7 +425,12 @@ class ContextAligning(Tasks):
             ts_proj = nn.functional.normalize(outputs.embeddings, dim=-1)         # [B, d]
             text_proj = nn.functional.normalize(outputs.description_emb, dim=-1)  # [B, d]
             B = ts_proj.size(0)
-            sim_matrix = torch.matmul(ts_proj, text_proj.T)  # [B, B]
+            sim_matrix = self._prior_calibrated_logits(
+                ts_proj,
+                text_proj,
+                outputs.prior_emb,
+                tau=0.07,
+            )  # [B, B]
 
             # ts → text
             labels_ts = torch.zeros(B, dtype=torch.long, device=ts_proj.device)
@@ -344,7 +439,7 @@ class ContextAligning(Tasks):
             neg_logits_ts = sim_matrix.masked_fill(mask_ts, -float('inf'))
             topk_neg_ts, _ = torch.topk(neg_logits_ts, k=self.num_negatives, dim=1)
             logits_ts = torch.cat([pos_logits_ts, topk_neg_ts], dim=1)
-            loss_ts2text = self.contrastive_criterion(logits_ts / 0.07, labels_ts)
+            loss_ts2text = self.contrastive_criterion(logits_ts, labels_ts)
 
             # text → ts
             labels_text = torch.zeros(B, dtype=torch.long, device=text_proj.device)
@@ -354,7 +449,7 @@ class ContextAligning(Tasks):
             neg_logits_text = sim_matrix_T.masked_fill(mask_text, -float('inf'))
             topk_neg_text, _ = torch.topk(neg_logits_text, k=self.num_negatives, dim=1)
             logits_text = torch.cat([pos_logits_text, topk_neg_text], dim=1)
-            loss_text2ts = self.contrastive_criterion(logits_text / 0.07, labels_text)
+            loss_text2ts = self.contrastive_criterion(logits_text, labels_text)
 
             loss_global = (loss_ts2text + loss_text2ts) / 2
             
@@ -362,7 +457,16 @@ class ContextAligning(Tasks):
             ts_channel = nn.functional.normalize(outputs.channel_embeddings.reshape(B * C, -1), dim=-1)  # [B*C, d]
             text_channel = nn.functional.normalize(outputs.channel_description_emb.reshape(B * C, -1), dim=-1)  # [B*C, d]
             BC = ts_channel.size(0)
-            sim_matrix = torch.matmul(ts_channel, text_channel.T)  # [B*C, B*C]
+            prior_channel = (
+                outputs.prior_emb.repeat_interleave(C, dim=0)
+                if outputs.prior_emb is not None else None
+            )
+            sim_matrix = self._prior_calibrated_logits(
+                ts_channel,
+                text_channel,
+                prior_channel,
+                tau=0.07,
+            )  # [B*C, B*C]
 
             # ts_channel → text_channel
             labels_ts = torch.zeros(BC, dtype=torch.long, device=ts_channel.device)
@@ -371,7 +475,7 @@ class ContextAligning(Tasks):
             neg_logits_ts = sim_matrix.masked_fill(mask_ts, -float('inf'))
             topk_neg_ts, _ = torch.topk(neg_logits_ts, k=self.num_negatives, dim=1)
             logits_ts = torch.cat([pos_logits_ts, topk_neg_ts], dim=1)
-            loss_ts2text = self.contrastive_criterion(logits_ts / 0.07, labels_ts)
+            loss_ts2text = self.contrastive_criterion(logits_ts, labels_ts)
 
             # text_channel → ts_channel
             labels_text = torch.zeros(BC, dtype=torch.long, device=text_channel.device)
@@ -381,14 +485,19 @@ class ContextAligning(Tasks):
             neg_logits_text = sim_matrix_T.masked_fill(mask_text, -float('inf'))
             topk_neg_text, _ = torch.topk(neg_logits_text, k=self.num_negatives, dim=1)
             logits_text = torch.cat([pos_logits_text, topk_neg_text], dim=1)
-            loss_text2ts = self.contrastive_criterion(logits_text / 0.07, labels_text)
+            loss_text2ts = self.contrastive_criterion(logits_text, labels_text)
 
             loss_channel = (loss_ts2text + loss_text2ts) / 2
             
             ## ✅ Event-level contrastive loss
             ts_proj = nn.functional.normalize(outputs.embeddings, dim=-1)         # [B, d]
             event_proj = nn.functional.normalize(outputs.event_emb, dim=-1)       # [B, d]
-            sim_matrix = torch.matmul(ts_proj, event_proj.T)  # [B, B]
+            sim_matrix = self._prior_calibrated_logits(
+                ts_proj,
+                event_proj,
+                outputs.prior_emb,
+                tau=0.07,
+            )  # [B, B]
 
             # ts → event
             labels_ts = torch.zeros(B, dtype=torch.long, device=ts_proj.device)
@@ -397,7 +506,7 @@ class ContextAligning(Tasks):
             neg_logits_ts = sim_matrix.masked_fill(mask_ts, -float('inf'))
             topk_neg_ts, _ = torch.topk(neg_logits_ts, k=self.num_negatives, dim=1)
             logits_ts = torch.cat([pos_logits_ts, topk_neg_ts], dim=1)
-            loss_ts2event = self.contrastive_criterion(logits_ts / 0.07, labels_ts)
+            loss_ts2event = self.contrastive_criterion(logits_ts, labels_ts)
 
             # event → ts
             labels_event = torch.zeros(B, dtype=torch.long, device=event_proj.device)
@@ -407,7 +516,7 @@ class ContextAligning(Tasks):
             neg_logits_event = sim_matrix_T.masked_fill(mask_text, -float('inf'))
             topk_neg_event, _ = torch.topk(neg_logits_event, k=self.num_negatives, dim=1)
             logits_event = torch.cat([pos_logits_event, topk_neg_event], dim=1)
-            loss_event2ts = self.contrastive_criterion(logits_event / 0.07, labels_event)
+            loss_event2ts = self.contrastive_criterion(logits_event, labels_event)
 
             loss_event = (loss_ts2event + loss_event2ts) / 2
             
@@ -416,7 +525,16 @@ class ContextAligning(Tasks):
             ## ✅ Channel-level contrastive loss
             ts_channel = nn.functional.normalize(outputs.channel_embeddings.reshape(B * C, -1), dim=-1)  # [B*C, d]
             text_channel = nn.functional.normalize(outputs.channel_description_emb.reshape(B * C, -1), dim=-1)  # [B*C, d]
-            logits_forward = torch.matmul(ts_channel, text_channel.T) / 0.07  # [B*C, B*C]
+            prior_channel = (
+                outputs.prior_emb.repeat_interleave(C, dim=0)
+                if outputs.prior_emb is not None else None
+            )
+            logits_forward = self._prior_calibrated_logits(
+                ts_channel,
+                text_channel,
+                prior_channel,
+                tau=0.07,
+            )  # [B*C, B*C]
             logits_backward = logits_forward.T  # [B*C, B*C]
             labels = torch.arange(B * C, device=ts_channel.device)
             loss_fwd = self.contrastive_criterion(logits_forward, labels)
@@ -426,7 +544,12 @@ class ContextAligning(Tasks):
             ## ✅ Sample-level contrastive loss
             ts = nn.functional.normalize(outputs.embeddings, dim=-1)  # [B, d]
             text = nn.functional.normalize(outputs.description_emb, dim=-1)  # [B, d]
-            logits_forward = torch.matmul(ts, text.T) / 0.07  # [B, B]
+            logits_forward = self._prior_calibrated_logits(
+                ts,
+                text,
+                outputs.prior_emb,
+                tau=0.07,
+            )  # [B, B]
             logits_backward = logits_forward.T
             labels = torch.arange(B, device=ts.device)
             loss_fwd = self.contrastive_criterion(logits_forward, labels)
@@ -436,7 +559,12 @@ class ContextAligning(Tasks):
             ## ✅ Event-level contrastive loss
             ts = nn.functional.normalize(outputs.cls_embedding, dim=-1)  # [B, d]
             event = nn.functional.normalize(outputs.event_emb, dim=-1)   # [B, d]
-            logits_forward = torch.matmul(ts, event.T) / 0.07
+            logits_forward = self._prior_calibrated_logits(
+                ts,
+                event,
+                outputs.prior_emb,
+                tau=0.07,
+            )
             logits_backward = logits_forward.T
             labels = torch.arange(B, device=ts.device)
             loss_fwd = self.contrastive_criterion(logits_forward, labels)
@@ -485,7 +613,12 @@ class ContextAligning(Tasks):
             ts_proj = nn.functional.normalize(outputs.embeddings, dim=-1)         # [B, d]
             text_proj = nn.functional.normalize(outputs.description_emb, dim=-1)  # [B, d]
             B = ts_proj.size(0)
-            sim_matrix = torch.matmul(ts_proj, text_proj.T)  # [B, B]
+            sim_matrix = self._prior_calibrated_logits(
+                ts_proj,
+                text_proj,
+                outputs.prior_emb,
+                tau=0.07,
+            )  # [B, B]
 
             # ts → text
             labels_ts = torch.zeros(B, dtype=torch.long, device=ts_proj.device)
@@ -494,7 +627,7 @@ class ContextAligning(Tasks):
             neg_logits_ts = sim_matrix.masked_fill(mask_ts, -float('inf'))
             topk_neg_ts, _ = torch.topk(neg_logits_ts, k=self.num_negatives, dim=1)
             logits_ts = torch.cat([pos_logits_ts, topk_neg_ts], dim=1)
-            loss_ts2text = self.contrastive_criterion(logits_ts / 0.07, labels_ts)
+            loss_ts2text = self.contrastive_criterion(logits_ts, labels_ts)
 
             # text → ts
             labels_text = torch.zeros(B, dtype=torch.long, device=text_proj.device)
@@ -504,7 +637,7 @@ class ContextAligning(Tasks):
             neg_logits_text = sim_matrix_T.masked_fill(mask_text, -float('inf'))
             topk_neg_text, _ = torch.topk(neg_logits_text, k=self.num_negatives, dim=1)
             logits_text = torch.cat([pos_logits_text, topk_neg_text], dim=1)
-            loss_text2ts = self.contrastive_criterion(logits_text / 0.07, labels_text)
+            loss_text2ts = self.contrastive_criterion(logits_text, labels_text)
 
             loss_global = (loss_ts2text + loss_text2ts) / 2
         
@@ -512,7 +645,12 @@ class ContextAligning(Tasks):
             ## ✅ Event-level contrastive loss
             ts_proj = nn.functional.normalize(outputs.embeddings, dim=-1)         # [B, d]
             event_proj = nn.functional.normalize(outputs.event_emb, dim=-1)       # [B, d]
-            sim_matrix = torch.matmul(ts_proj, event_proj.T)  # [B, B]
+            sim_matrix = self._prior_calibrated_logits(
+                ts_proj,
+                event_proj,
+                outputs.prior_emb,
+                tau=0.07,
+            )  # [B, B]
 
             # ts → event
             labels_ts = torch.zeros(B, dtype=torch.long, device=ts_proj.device)
@@ -521,7 +659,7 @@ class ContextAligning(Tasks):
             neg_logits_ts = sim_matrix.masked_fill(mask_ts, -float('inf'))
             topk_neg_ts, _ = torch.topk(neg_logits_ts, k=self.num_negatives, dim=1)
             logits_ts = torch.cat([pos_logits_ts, topk_neg_ts], dim=1)
-            loss_ts2event = self.contrastive_criterion(logits_ts / 0.07, labels_ts)
+            loss_ts2event = self.contrastive_criterion(logits_ts, labels_ts)
 
             # event → ts
             labels_event = torch.zeros(B, dtype=torch.long, device=event_proj.device)
@@ -531,7 +669,7 @@ class ContextAligning(Tasks):
             neg_logits_event = sim_matrix_T.masked_fill(mask_text, -float('inf'))
             topk_neg_event, _ = torch.topk(neg_logits_event, k=self.num_negatives, dim=1)
             logits_event = torch.cat([pos_logits_event, topk_neg_event], dim=1)
-            loss_event2ts = self.contrastive_criterion(logits_event / 0.07, labels_event)
+            loss_event2ts = self.contrastive_criterion(logits_event, labels_event)
 
             loss_event = (loss_ts2event + loss_event2ts) / 2
             
@@ -541,7 +679,12 @@ class ContextAligning(Tasks):
             ## ✅ Sample-level contrastive loss
             ts = nn.functional.normalize(outputs.embeddings, dim=-1)  # [B, d]
             text = nn.functional.normalize(outputs.description_emb, dim=-1)  # [B, d]
-            logits_forward = torch.matmul(ts, text.T) / 0.07  # [B, B]
+            logits_forward = self._prior_calibrated_logits(
+                ts,
+                text,
+                outputs.prior_emb,
+                tau=0.07,
+            )  # [B, B]
             logits_backward = logits_forward.T
             labels = torch.arange(B, device=ts.device)
             loss_fwd = self.contrastive_criterion(logits_forward, labels)
@@ -551,7 +694,12 @@ class ContextAligning(Tasks):
             ## ✅ Event-level contrastive loss
             ts = nn.functional.normalize(outputs.cls_embedding, dim=-1)  # [B, d]
             event = nn.functional.normalize(outputs.event_emb, dim=-1)   # [B, d]
-            logits_forward = torch.matmul(ts, event.T) / 0.07
+            logits_forward = self._prior_calibrated_logits(
+                ts,
+                event,
+                outputs.prior_emb,
+                tau=0.07,
+            )
             logits_backward = logits_forward.T
             labels = torch.arange(B, device=ts.device)
             loss_fwd = self.contrastive_criterion(logits_forward, labels)

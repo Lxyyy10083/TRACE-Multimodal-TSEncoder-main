@@ -43,16 +43,24 @@ def _collate_fn_forecasting(examples):
     if examples[0].time_feat is not None:
         time_feat = [torch.from_numpy(example.time_feat) for example in examples]
         batch_kwargs["time_feat"] = torch.stack(time_feat)  # [B, T, D]
+        assert batch_kwargs["time_feat"].ndim == 3, (
+            f"batched time_feat must be [B, T, D], got {batch_kwargs['time_feat'].shape}"
+        )
 
     if examples[0].time_feat_weight is not None:
         time_feat_weight = [
             torch.from_numpy(example.time_feat_weight) for example in examples
         ]
         batch_kwargs["time_feat_weight"] = torch.stack(time_feat_weight)  # [B, T, D]
+        assert batch_kwargs["time_feat_weight"].shape == batch_kwargs["time_feat"].shape, (
+            "batched time_feat_weight must match time_feat shape, "
+            f"got {batch_kwargs['time_feat_weight'].shape} vs {batch_kwargs['time_feat'].shape}"
+        )
 
     if examples[0].domain_id is not None:
         domain_id = [int(np.asarray(example.domain_id).item()) for example in examples]
         batch_kwargs["domain_id"] = torch.tensor(domain_id, dtype=torch.long)  # [B]
+        assert batch_kwargs["domain_id"].dtype == torch.long, "domain_id must be int64"
     
     if examples[0].prior_y is not None:
         prior_y = [torch.from_numpy(example.prior_y) for example in examples] # [C, H]

@@ -21,16 +21,83 @@ class ForecastFinetuning(Tasks):
         super().__init__(args=args, **kwargs)
         self.args = args
         self._build_model()
+        self._logged_time_prior_batch = False
+
+    def _unpack_batch_with_time_prior(self, batch):
+        """Support both TimeseriesData batches and tuple batches with time priors."""
+        if isinstance(batch, (tuple, list)):
+            if len(batch) >= 6:
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = batch[:6]
+            elif len(batch) >= 5:
+                batch_x, batch_y, text, time_feat, domain_id = batch[:5]
+                time_feat_weight = None
+            elif len(batch) == 3:
+                batch_x, batch_y, text = batch
+                time_feat, time_feat_weight, domain_id = None, None, None
+            elif len(batch) == 2:
+                batch_x, batch_y = batch
+                text, time_feat, time_feat_weight, domain_id = None, None, None, None
+            else:
+                batch_x = batch[0]
+                batch_y, text, time_feat, time_feat_weight, domain_id = None, None, None, None, None
+            return batch_x, batch_y, text, time_feat, time_feat_weight, domain_id
+
+        return (
+            batch,
+            getattr(batch, "forecast", None),
+            getattr(batch, "descriptions", None),
+            getattr(batch, "time_feat", None),
+            getattr(batch, "time_feat_weight", None),
+            getattr(batch, "domain_id", None),
+        )
+
+    def _move_time_prior_to_device(self, time_feat, time_feat_weight, domain_id):
+        """Move optional time prior tensors to the active training device."""
+        if time_feat is not None:
+            if not torch.is_tensor(time_feat):
+                time_feat = torch.as_tensor(time_feat)
+            time_feat = time_feat.to(self.device)
+        if time_feat_weight is not None:
+            if not torch.is_tensor(time_feat_weight):
+                time_feat_weight = torch.as_tensor(time_feat_weight)
+            time_feat_weight = time_feat_weight.to(self.device)
+        if domain_id is not None:
+            if not torch.is_tensor(domain_id):
+                domain_id = torch.as_tensor(domain_id, dtype=torch.long)
+            domain_id = domain_id.to(self.device)
+        return time_feat, time_feat_weight, domain_id
+
+    def _log_time_prior_batch_once(self, batch_x, time_feat, domain_id):
+        if self._logged_time_prior_batch or time_feat is None or domain_id is None:
+            return
+        batch_x_shape = (
+            batch_x.timeseries.shape if hasattr(batch_x, "timeseries") else batch_x.shape
+        )
+        print(
+            "[ForecastFinetuning] time prior batch: "
+            f"batch_x.shape={batch_x_shape}, "
+            f"time_feat.shape={time_feat.shape}, "
+            f"domain_id.shape={domain_id.shape}"
+        )
+        self._logged_time_prior_batch = True
     
     def validation(self, data_loader, return_preds: bool = False):
         trues, preds, histories= [], [], []
         loss_list = []
         self.model.eval()
         with torch.no_grad():
-            for batch_x in tqdm(data_loader, total=len(data_loader)):
-                timeseries = batch_x.timeseries.float().to(self.device) #[B, C, L]
-                input_mask = batch_x.input_mask.long().to(self.device) #[B, C, L]
-                forecast = batch_x.forecast.float().to(self.device)  #[B, C, H]
+            for batch in tqdm(data_loader, total=len(data_loader)):
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = self._unpack_batch_with_time_prior(batch)
+                if hasattr(batch_x, "timeseries"):
+                    timeseries = batch_x.timeseries.float().to(self.device) #[B, C, L]
+                    input_mask = batch_x.input_mask.long().to(self.device) #[B, C, L]
+                    forecast = batch_x.forecast.float().to(self.device)  #[B, C, H]
+                else:
+                    timeseries = batch_x.float().to(self.device)
+                    input_mask = torch.ones_like(timeseries, dtype=torch.long)
+                    forecast = batch_y.float().to(self.device)
+                time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
+                self._log_time_prior_batch_once(batch_x, time_feat, domain_id)
 
                 with torch.autocast(
                     device_type="cuda",
@@ -38,7 +105,12 @@ class ForecastFinetuning(Tasks):
                     enabled=self.args.use_amp,
                 ):
                     outputs = self.model(
-                        x_enc=timeseries, input_mask=input_mask, mask=None
+                        x_enc=timeseries,
+                        input_mask=input_mask,
+                        mask=None,
+                        time_feat=time_feat,
+                        time_feat_weight=time_feat_weight,
+                        domain_id=domain_id,
                     )
 
                 loss = self.criterion(outputs.forecast, forecast)
@@ -98,7 +170,11 @@ class ForecastFinetuning(Tasks):
             self.load_pretrained_ts_encoder(pretraining_task_name="pretraining", do_not_copy_head=True)
     
         self.model.to(self.args.rank)
-        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.args.rank])
+        self.model = torch.nn.parallel.DistributedDataParallel(
+            self.model,
+            device_ids=[self.args.rank],
+            find_unused_parameters=getattr(self.args, "use_temporal_prior", False),
+        )
         # self.early_stopping = EarlyStopping(patience=self.args.patience, delta=self.args.delta)
         
         
@@ -111,11 +187,19 @@ class ForecastFinetuning(Tasks):
             if self.args.distributed and isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(cur_epoch)
                 
-            for batch_x in tqdm(self.train_dataloader, total=len(self.train_dataloader)):
+            for batch in tqdm(self.train_dataloader, total=len(self.train_dataloader)):
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = self._unpack_batch_with_time_prior(batch)
                 self.optimizer.zero_grad(set_to_none=True)
-                timeseries = batch_x.timeseries.float().to(self.device)  #[B, C, L]
-                input_mask = batch_x.input_mask.long().to(self.device)  #[B, C, L]
-                forecast = batch_x.forecast.float().to(self.device)  #[B, C, H]
+                if hasattr(batch_x, "timeseries"):
+                    timeseries = batch_x.timeseries.float().to(self.device)  #[B, C, L]
+                    input_mask = batch_x.input_mask.long().to(self.device)  #[B, C, L]
+                    forecast = batch_x.forecast.float().to(self.device)  #[B, C, H]
+                else:
+                    timeseries = batch_x.float().to(self.device)
+                    input_mask = torch.ones_like(timeseries, dtype=torch.long)
+                    forecast = batch_y.float().to(self.device)
+                time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
+                self._log_time_prior_batch_once(batch_x, time_feat, domain_id)
                 if not self.args.set_input_mask:
                     input_mask = torch.ones_like(input_mask)
 
@@ -124,7 +208,13 @@ class ForecastFinetuning(Tasks):
                     dtype=dtype_map(self.args.torch_dtype),
                     enabled=self.args.use_amp,
                 ):
-                    outputs = self.model(x_enc=timeseries, input_mask=input_mask)
+                    outputs = self.model(
+                        x_enc=timeseries,
+                        input_mask=input_mask,
+                        time_feat=time_feat,
+                        time_feat_weight=time_feat_weight,
+                        domain_id=domain_id,
+                    )
 
                 
                 loss = self.criterion(outputs.forecast, forecast)

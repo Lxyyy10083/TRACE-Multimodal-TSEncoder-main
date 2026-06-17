@@ -12,6 +12,8 @@ from src.models.layers.embed import TimeEmbedding
 from src.models.layers.revin import RevIN
 from src.models.layers.prediction_head import ForecastingHead, ReconstructionHead, EmbeddingHead, RetrievalAugmentedHead
 from src.models.layers.get_encoder import get_transformer_backbone
+from src.models.layers.time_prior import TemporalPriorEncoder
+from src.data.time_prior_features import TIME_FEATURE_NAMES
 
 class TS_Encoder(nn.Module):
     def __init__(self, configs: Namespace | dict, **kwargs: dict):
@@ -53,6 +55,28 @@ class TS_Encoder(nn.Module):
         # Transformer backbone
         self.d_model = configs.d_model
         self.encoder = get_transformer_backbone(configs)
+        self.use_temporal_prior = configs.getattr("use_temporal_prior", False)
+        self.prior_alpha = configs.getattr("prior_alpha", 0.1)
+        self._logged_temporal_prior = False
+        self._logged_forecast_temporal_prior = False
+        if self.use_temporal_prior:
+            prior_input_dim = configs.getattr("prior_input_dim", None)
+            if prior_input_dim is None:
+                prior_input_dim = len(TIME_FEATURE_NAMES)
+                print(
+                    "[TS_Encoder] prior_input_dim was null; "
+                    f"inferred {prior_input_dim} from TIME_FEATURE_NAMES."
+                )
+            self.temporal_prior_encoder = TemporalPriorEncoder(
+                prior_input_dim=prior_input_dim,
+                num_domains=configs.getattr("num_domains", 10),
+                domain_emb_dim=configs.getattr("domain_emb_dim", 32),
+                d_model=configs.d_model,
+                dropout=configs.getattr("prior_dropout", configs.getattr("dropout", 0.1)),
+                hidden_dim=configs.getattr("prior_hidden_dim", None),
+            )
+        else:
+            self.temporal_prior_encoder = None
 
         # Prediction Head
         self.head = self._get_head(self.task_name)
@@ -180,6 +204,47 @@ class TS_Encoder(nn.Module):
         )
         return enc_out, attns
 
+    def _apply_temporal_prior_to_cls(
+        self,
+        h_cls,
+        time_feat=None,
+        time_feat_weight=None,
+        domain_id=None,
+    ):
+        """
+        Add domain-aware temporal prior to the CLS representation only.
+
+        This keeps patch tokens, channel tokens, attention masks, and positional
+        encodings unchanged. If the prior is disabled or any input is missing,
+        TRACE falls back to the original CLS behavior.
+        """
+        if (
+            not self.use_temporal_prior
+            or self.temporal_prior_encoder is None
+            or h_cls is None
+            or time_feat is None
+            or time_feat_weight is None
+            or domain_id is None
+        ):
+            return h_cls, None
+
+        prior_emb = self.temporal_prior_encoder(
+            time_feat=time_feat.to(h_cls.device),
+            time_feat_weight=time_feat_weight.to(h_cls.device),
+            domain_id=domain_id.to(h_cls.device),
+        )
+        h_cls = h_cls + self.prior_alpha * prior_emb
+        if not self._logged_temporal_prior:
+            print(
+                "[TS_Encoder] temporal prior applied: "
+                f"h_cls.shape={h_cls.shape}, "
+                f"prior_emb.shape={prior_emb.shape}, "
+                f"prior_alpha={self.prior_alpha}, "
+                f"use_temporal_prior={self.use_temporal_prior}"
+            )
+            self._logged_temporal_prior = True
+        return h_cls, prior_emb
+
 
     def embed(
         self,
@@ -205,6 +270,15 @@ class TS_Encoder(nn.Module):
         # Decoder
         input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         emb_dict= self.head(enc_out, input_mask_patch_view, shape=self.dec_shape)
+        h_cls, prior_emb = self._apply_temporal_prior_to_cls(
+            emb_dict["cls"],
+            time_feat=kwargs.get("time_feat", None),
+            time_feat_weight=kwargs.get("time_feat_weight", None),
+            domain_id=kwargs.get("domain_id", None),
+        )
+        if prior_emb is not None:
+            emb_dict["cls"] = h_cls
+            emb_dict["global"] = h_cls
 
 
         return TimeseriesOutputs(
@@ -212,6 +286,7 @@ class TS_Encoder(nn.Module):
             embeddings=emb_dict["global"], # [B, d_model]
             channel_embeddings=emb_dict["channels"], # [B, C, d_model]
             cls_embedding=emb_dict["cls"], # [B, d_model]
+            prior_emb=prior_emb,
         )
 
     def pretraining(
@@ -280,17 +355,46 @@ class TS_Encoder(nn.Module):
 
         # Decoder
         reconstruction = self.head["reconstruct_head"](enc_out, shape=self.dec_shape)  # [B, C, L]
-        forecasting = self.head["forecasting_head"](enc_out, shape=self.dec_shape)  # z: [B, C, H]
+        prior_emb = None
+        use_cls_context = False
+        forecast_enc_out = enc_out
+        if self.dec_shape == "BTD":
+            h_cls, prior_emb = self._apply_temporal_prior_to_cls(
+                enc_out[:, 0, :],
+                time_feat=kwargs.get("time_feat", None),
+                time_feat_weight=kwargs.get("time_feat_weight", None),
+                domain_id=kwargs.get("domain_id", None),
+            )
+            if prior_emb is not None:
+                forecast_enc_out = enc_out.clone()
+                forecast_enc_out[:, 0, :] = h_cls
+                use_cls_context = True
+        forecasting = self.head["forecasting_head"](
+            forecast_enc_out,
+            shape=self.dec_shape,
+            use_cls_context=use_cls_context,
+        )  # z: [B, C, H]
 
         # De-Normalization
         reconstruction = self.normalizer(x=reconstruction, mode="denorm")  #[B, C, L]
         forecasting = self.normalizer(x=forecasting, mode="denorm")  #[B, C, H]
+        if prior_emb is not None and not self._logged_forecast_temporal_prior:
+            print(
+                "[TS_Encoder] forecasting temporal prior: "
+                f"hidden.shape={forecast_enc_out.shape}, "
+                f"prior_emb.shape={prior_emb.shape}, "
+                f"pred.shape={forecasting.shape}, "
+                f"prior_alpha={self.prior_alpha}, "
+                f"use_temporal_prior={self.use_temporal_prior}"
+            )
+            self._logged_forecast_temporal_prior = True
 
         return TimeseriesOutputs(
             input_mask=input_mask,  # [B, C, L]
             reconstruction=reconstruction,  # [B, C, L]
             pretrain_mask=pretrain_mask,  # [B, C, L]
             forecast=forecasting,  # [B, C, H]
+            prior_emb=prior_emb,
         )
 
 
@@ -312,14 +416,44 @@ class TS_Encoder(nn.Module):
         enc_out, attns = self._get_encoding_out(x_enc, pretrain_mask, input_mask)
 
         # Decoder
-        dec_out = self.head(enc_out, shape=self.dec_shape)  # z: [B, C, H]
+        prior_emb = None
+        use_cls_context = False
+        if self.dec_shape == "BTD":
+            h_cls, prior_emb = self._apply_temporal_prior_to_cls(
+                enc_out[:, 0, :],
+                time_feat=kwargs.get("time_feat", None),
+                time_feat_weight=kwargs.get("time_feat_weight", None),
+                domain_id=kwargs.get("domain_id", None),
+            )
+            if prior_emb is not None:
+                enc_out = enc_out.clone()
+                enc_out[:, 0, :] = h_cls
+                use_cls_context = True
+
+        dec_out = self.head(
+            enc_out,
+            shape=self.dec_shape,
+            use_cls_context=use_cls_context,
+        )  # z: [B, C, H]
 
         # De-Normalization
         dec_out = self.normalizer(x=dec_out, mode="denorm")  #[B, C, H]
+        if prior_emb is not None and not self._logged_forecast_temporal_prior:
+            print(
+                "[TS_Encoder] forecasting temporal prior: "
+                f"hidden.shape={enc_out.shape}, "
+                f"prior_emb.shape={prior_emb.shape}, "
+                f"pred.shape={dec_out.shape}, "
+                f"prior_alpha={self.prior_alpha}, "
+                f"use_temporal_prior={self.use_temporal_prior}"
+            )
+            self._logged_forecast_temporal_prior = True
 
         return TimeseriesOutputs(
             input_mask=input_mask,
-            forecast=dec_out)
+            forecast=dec_out,
+            prior_emb=prior_emb,
+        )
 
     def rag_forecasting(
         self, x_enc: torch.Tensor,

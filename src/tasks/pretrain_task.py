@@ -21,14 +21,64 @@ class Pretraining(Tasks):
         self._build_model()
         count_parameters(self.model)
 
+    def _unpack_batch_with_time_prior(self, batch):
+        """Support TimeseriesData and tuple batches carrying optional time priors."""
+        if isinstance(batch, (tuple, list)):
+            if len(batch) >= 6:
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = batch[:6]
+            elif len(batch) >= 5:
+                batch_x, batch_y, text, time_feat, domain_id = batch[:5]
+                time_feat_weight = None
+            elif len(batch) == 3:
+                batch_x, batch_y, text = batch
+                time_feat, time_feat_weight, domain_id = None, None, None
+            elif len(batch) == 2:
+                batch_x, batch_y = batch
+                text, time_feat, time_feat_weight, domain_id = None, None, None, None
+            else:
+                batch_x = batch[0]
+                batch_y, text, time_feat, time_feat_weight, domain_id = None, None, None, None, None
+            return batch_x, batch_y, text, time_feat, time_feat_weight, domain_id
+
+        return (
+            batch,
+            getattr(batch, "forecast", None),
+            getattr(batch, "descriptions", None),
+            getattr(batch, "time_feat", None),
+            getattr(batch, "time_feat_weight", None),
+            getattr(batch, "domain_id", None),
+        )
+
+    def _move_time_prior_to_device(self, time_feat, time_feat_weight, domain_id):
+        """Move optional time prior tensors to the active training device."""
+        if time_feat is not None:
+            if not torch.is_tensor(time_feat):
+                time_feat = torch.as_tensor(time_feat)
+            time_feat = time_feat.to(self.device)
+        if time_feat_weight is not None:
+            if not torch.is_tensor(time_feat_weight):
+                time_feat_weight = torch.as_tensor(time_feat_weight)
+            time_feat_weight = time_feat_weight.to(self.device)
+        if domain_id is not None:
+            if not torch.is_tensor(domain_id):
+                domain_id = torch.as_tensor(domain_id, dtype=torch.long)
+            domain_id = domain_id.to(self.device)
+        return time_feat, time_feat_weight, domain_id
+
     def validation(self, data_loader, return_preds: bool = False, split: str = "val"):
         loss = {"forecast_losses": [], "total_losses": []}
 
         self.model.eval()
         with torch.no_grad():
-            for batch_x in tqdm(data_loader, total=len(data_loader)):
-                timeseries = batch_x.timeseries.float().to(self.device) #[B, C, L]
-                input_mask = batch_x.input_mask.long().to(self.device) #[B, C, L]
+            for batch in tqdm(data_loader, total=len(data_loader)):
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = self._unpack_batch_with_time_prior(batch)
+                if hasattr(batch_x, "timeseries"):
+                    timeseries = batch_x.timeseries.float().to(self.device) #[B, C, L]
+                    input_mask = batch_x.input_mask.long().to(self.device) #[B, C, L]
+                else:
+                    timeseries = batch_x.float().to(self.device)
+                    input_mask = torch.ones_like(timeseries, dtype=torch.long)
+                time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
 
                 with torch.autocast(
                     device_type="cuda",
@@ -36,7 +86,12 @@ class Pretraining(Tasks):
                     enabled=self.args.use_amp,
                 ):
                     outputs = self.model(
-                        x_enc=timeseries, input_mask=input_mask, mask=None
+                        x_enc=timeseries,
+                        input_mask=input_mask,
+                        mask=None,
+                        time_feat=time_feat,
+                        time_feat_weight=time_feat_weight,
+                        domain_id=domain_id,
                     )
 
                 recon_loss = self.forecast_criterion(outputs.reconstruction, timeseries)  #[B, C, L]
@@ -93,12 +148,18 @@ class Pretraining(Tasks):
             if self.args.distributed and isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(cur_epoch)
 
-            for batch_x in tqdm(
+            for batch in tqdm(
                 self.train_dataloader, total=len(self.train_dataloader)
             ):
+                batch_x, batch_y, text, time_feat, time_feat_weight, domain_id = self._unpack_batch_with_time_prior(batch)
                 self.optimizer.zero_grad(set_to_none=True)
-                timeseries = batch_x.timeseries.float().to(self.device)  #[B, C, L]
-                input_mask = batch_x.input_mask.long().to(self.device)  #[B, C, L]
+                if hasattr(batch_x, "timeseries"):
+                    timeseries = batch_x.timeseries.float().to(self.device)  #[B, C, L]
+                    input_mask = batch_x.input_mask.long().to(self.device)  #[B, C, L]
+                else:
+                    timeseries = batch_x.float().to(self.device)
+                    input_mask = torch.ones_like(timeseries, dtype=torch.long)
+                time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
 
                 if not self.args.set_input_mask:
                     input_mask = torch.ones_like(input_mask)
@@ -108,7 +169,13 @@ class Pretraining(Tasks):
                     dtype=dtype_map(self.args.torch_dtype),
                     enabled=self.args.use_amp,
                 ):
-                    outputs = self.model(x_enc=timeseries, input_mask=input_mask)
+                    outputs = self.model(
+                        x_enc=timeseries,
+                        input_mask=input_mask,
+                        time_feat=time_feat,
+                        time_feat_weight=time_feat_weight,
+                        domain_id=domain_id,
+                    )
 
                 recon_loss = self.forecast_criterion(outputs.reconstruction, timeseries)  #[B, C, L]
                 observed_mask = input_mask * (1 - outputs.pretrain_mask)  #[B, C, L]

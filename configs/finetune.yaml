@@ -29,6 +29,22 @@ set_input_mask: True # Whether to set the input mask
 output_attention: False # Whether to output the attention weights
 activation: 'gelu'      # "gelu" or "relu"
 flash_attention: False
+use_temporal_prior: true
+use_prior_calibrated_logits: true
+prior_hidden_dim: 128
+prior_input_dim: null
+domain_emb_dim: 32
+num_domains: 10
+prior_alpha: 0.1
+prior_beta: 0.1
+prior_dropout: 0.1
+use_month: true
+use_season: true
+use_day_of_year: true
+use_weekday: true
+use_solar_term: false
+domain_name: Agriculture
+use_prior_guided_hard_negative: false
 
 
 # Logging

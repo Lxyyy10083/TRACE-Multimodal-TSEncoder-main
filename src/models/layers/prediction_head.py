@@ -112,17 +112,28 @@ class ForecastingHead(nn.Module):
         self.forecast_horizon = forecast_horizon
         self.linear = nn.Linear(self.head_nf, forecast_horizon)
 
-    def forward(self, x, input_mask: torch.Tensor = None, shape: str = "BTD"):
+    def forward(
+        self,
+        x,
+        input_mask: torch.Tensor = None,
+        shape: str = "BTD",
+        use_cls_context: bool = False,
+    ):
         """
         Input:
             x: [B, total_len, d_model], where total_len = N * C + C + 1
                 or [B, C, N, d_model]
             input_mask: [B, C, N]
+            use_cls_context: if True, inject the current CLS token into the
+                forecasting features. This lets an enhanced CLS representation
+                influence prediction without changing patch/CIT tokens.
         Output:
             [B, C, forecast_horizon]
         """
         if shape == "BTD":
-            x, _, _ = decompose_token_sequence(x, num_channels=self.num_channels)  #[B, C, N, d_model]
+            x, _, cls_token = decompose_token_sequence(x, num_channels=self.num_channels)  #[B, C, N, d_model]
+            if use_cls_context and cls_token is not None:
+                x = x + cls_token.unsqueeze(1).unsqueeze(2)
         x = self.flatten(x)  # x: [B, C, N * d_model] 
         x = self.linear(x)  # x: [B, C, forecast_horizon]
         x = self.dropout(x)  # x: [B, C, forecast_horizon]

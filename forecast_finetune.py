@@ -7,6 +7,12 @@ from src.common import PATHS
 from src.tasks.forecast_finetune_task import ForecastFinetuning
 from src.utils.config import Config
 from src.utils.tools import control_randomness, make_dir_if_not_exists, parse_config
+from src.utils.time_prior_config import (
+    add_time_prior_args,
+    apply_time_prior_overrides,
+    print_time_prior_summary,
+    resolve_time_prior_config,
+)
 
 NOTES = "Supervised finetuning on forecasting datasets"
 
@@ -33,6 +39,7 @@ def main_worker():
     parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--ts_only", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
+    add_time_prior_args(parser)
     args_cmd = parser.parse_args()
 
     # ========== Config & Reproducibility ==========
@@ -48,6 +55,7 @@ def main_worker():
     config["world_size"] = world_size
     config["distributed"] = True
     config["checkpoint_path"] = PATHS.CHECKPOINTS_DIR + "forecasting/"
+    apply_time_prior_overrides(config, args_cmd)
     make_dir_if_not_exists(config["checkpoint_path"])
 
     args = parse_config(config)
@@ -64,8 +72,10 @@ def main_worker():
     args.top_k = args_cmd.top_k
     args.ts_only = args_cmd.ts_only
     args.debug = args_cmd.debug
+    args = resolve_time_prior_config(args)
     
     if global_rank == 0:
+        print_time_prior_summary(args)
         print(f"[Rank {global_rank}] Running with config:\n{args}\n")
 
     # ========== Main Training ==========

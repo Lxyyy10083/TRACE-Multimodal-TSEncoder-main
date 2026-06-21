@@ -99,7 +99,19 @@ def _collate_fn_retrieval(examples):
     event_emb = [example.event_emb for example in examples]
     event_emb = torch.stack(event_emb)  # [B, d]
     
-    if hasattr(examples[0], 'descriptions'): #in test set
+    prior_kwargs = {}
+    if examples[0].time_feat is not None:
+        prior_kwargs["time_feat"] = torch.stack([
+            torch.from_numpy(example.time_feat) for example in examples
+        ])
+        prior_kwargs["time_feat_weight"] = torch.stack([
+            torch.from_numpy(example.time_feat_weight) for example in examples
+        ])
+        prior_kwargs["domain_id"] = torch.tensor([
+            int(np.asarray(example.domain_id).item()) for example in examples
+        ], dtype=torch.long)
+
+    if examples[0].descriptions is not None: #in test set
         descriptions = [example.descriptions for example in examples]
         events = [example.events for example in examples]
         return TimeseriesData(timeseries=timeseries,
@@ -109,14 +121,16 @@ def _collate_fn_retrieval(examples):
                               description_emb=description_emb, 
                               event_emb=event_emb, 
                               descriptions=descriptions, 
-                              events=events)
+                              events=events,
+                              **prior_kwargs)
     else:
         return TimeseriesData(timeseries=timeseries,
                               input_mask=input_masks, 
                               labels=labels, 
                               channel_description_emb=channel_description_emb, 
                               description_emb=description_emb, 
-                              event_emb=event_emb)
+                              event_emb=event_emb,
+                              **prior_kwargs)
 
 def get_dataloader(args):
     if hasattr(args, "data_name") and str(args.data_name).lower() in MMD_DATA_NAMES:
@@ -155,6 +169,8 @@ def get_dataloader(args):
                 data_split=args.data_split,
                 scale=args.scale,
                 text_encoder_name=args.text_encoder_name,
+                domain_name=getattr(args, "domain_name", None),
+                n_channels=args.n_channels,
             )
         else:
             raise ValueError(f"Invalid task name: {args.task_name}")

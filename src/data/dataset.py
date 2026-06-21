@@ -375,6 +375,8 @@ class RetrievalDataset(TaskDataset):
         data_split: str = "train",
         scale: bool = True,
         text_encoder_name: str = "bert-base-uncased",
+        domain_name: str = None,
+        n_channels: int = 7,
         upsampling_pad_direction="backward",
         upsampling_type="pad",
         pad_mode="constant"):
@@ -387,14 +389,25 @@ class RetrievalDataset(TaskDataset):
         self.upsampling_type = upsampling_type
         self.pad_mode = pad_mode
         self.text_encoder_name = text_encoder_name
+        self.domain_name = domain_name
+        self.n_channels = n_channels
         self._read_data()
 
     def _read_data(self) -> TimeseriesData:
         self.scaler = StandardScaler()
+        payload, self.retrieval_metadata = load_retrieval_from_parquet(
+            self.data_split,
+            self.root_path,
+            self.text_encoder_name,
+            domain_name=self.domain_name,
+            seq_len_channel=self.seq_len_channel,
+            n_channels=self.n_channels,
+            return_metadata=True,
+        )
         if self.data_split == "train":
-            self.data, self.descriptions_emb, self.channel_descriptions_emb, self.events_emb, self.labels= load_retrieval_from_parquet(self.data_split, self.root_path, self.text_encoder_name)
+            self.data, self.descriptions_emb, self.channel_descriptions_emb, self.events_emb, self.labels = payload
         else:
-            self.data, self.descriptions_emb, self.channel_descriptions_emb, self.events_emb, self.labels, self.descriptions, self.channel_descriptions, self.events= load_retrieval_from_parquet(self.data_split, self.root_path, self.text_encoder_name)
+            self.data, self.descriptions_emb, self.channel_descriptions_emb, self.events_emb, self.labels, self.descriptions, self.channel_descriptions, self.events = payload
         self._check_and_remove_nans()
         self.n_timeseries = len(self.data)
         if self.scale:
@@ -417,6 +430,21 @@ class RetrievalDataset(TaskDataset):
                 sampling_type=self.upsampling_type,
                 mode=self.pad_mode,
             )
+        else:
+            timeseries = timeseries[:, -self.seq_len_channel:]
+            input_mask = np.ones_like(timeseries)
+
+        prior_kwargs = {}
+        if self.retrieval_metadata is not None:
+            prior_kwargs = {
+                "time_feat": self.retrieval_metadata["time_feat"][index],
+                "time_feat_weight": self.retrieval_metadata["time_feat_weight"][index],
+                "domain_id": np.array(self.retrieval_metadata["domain_id"], dtype=np.int64),
+                "metadata": {
+                    "date": self.retrieval_metadata["dates"][index],
+                    "source_path": self.retrieval_metadata["source_path"],
+                },
+            }
         
         if self.data_split == "train":
             return TimeseriesData(
@@ -426,6 +454,7 @@ class RetrievalDataset(TaskDataset):
                 channel_description_emb=self.channel_descriptions_emb[index], #[C, d]
                 event_emb=self.events_emb[index],
                 input_mask=input_mask,  # [C,L]
+                **prior_kwargs,
             )
         else:
             return TimeseriesData(
@@ -438,6 +467,7 @@ class RetrievalDataset(TaskDataset):
                 # channel_descriptions=self.channel_descriptions[index],
                 events=self.events[index],
                 input_mask=input_mask,  # [C,L]
+                **prior_kwargs,
             )
 
     def _check_and_remove_nans(self):

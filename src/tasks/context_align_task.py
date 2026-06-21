@@ -17,7 +17,7 @@ from src.utils.metrics import compute_precision_at_k, compute_mrr
 from rouge_score import rouge_scorer
 from multiprocessing import Pool
 
-def compute_simiarltiy_batch(args):
+def compute_similarity_batch(args):
     i, pred_idx, query_text, candidate_text, query_embedding, candidate_embedding = args
 
     # Cosine similarity (using precomputed embeddings)
@@ -102,117 +102,167 @@ class ContextAligning(Tasks):
             return model.prior_calibrated_logits(ts_emb, text_emb, prior_emb, tau=tau)
         return torch.matmul(ts_emb, text_emb.T) / tau
     
-    
     def compute_retrieval_metrics(self,
-                                  query_embeddings, 
-                                  candidate_embeddings,
-                                  query_raw, 
-                                  candidate_raw,
-                                  query_labels, 
-                                  candidate_labels,
-                                  query_timeseries, 
-                                  candidate_timeseries,
-                                  retrieval_direction="text2ts",
-                                  topk=10,
-                                  current_epoch=0):
+                                query_embeddings, 
+                                candidate_embeddings,
+                                query_raw, 
+                                candidate_raw,
+                                query_labels, 
+                                candidate_labels,
+                                query_timeseries, 
+                                candidate_timeseries,
+                                retrieval_direction="text2ts",
+                                topk=10,
+                                current_epoch=0):
         """
-        Utility function to compute retrieval metrics
-        query_embeddings: [N, d]
-        candidate_embeddings: [N, d]
-        query_raw: length = N
-        candidate_raw: length = N
-        query_labels: [N]
-        candidate_labels: [N]
-        query_timeseries: [N, C, L]
+        Utility function to compute retrieval metrics.
+
+        query_embeddings: [N_query, d]
+        candidate_embeddings: [N_candidate, d]
+        query_raw: length = N_query
+        candidate_raw: length = N_candidate
+        query_labels: [N_query]
+        candidate_labels: [N_candidate]
+        query_timeseries: [N_query, C, L]
+        candidate_timeseries: [N_candidate, C, L]
         """
 
-        similarity = torch.matmul(query_embeddings, candidate_embeddings.T)  # [N_query, N_candidate]
-        indices = similarity.topk(k=topk, dim=-1).indices  # [N_query, topk]
-        # ground truth: assume perfect alignment
-        gt = torch.arange(similarity.shape[0], device=similarity.device)  # example: [0, 1, 2, 3, 4]
-        # compute recall/precision/mrr
-        mrr =  reciprocal_rank_tensor(similarity, gt)
-        precision_at_1 = retrieval_precision_tensor(similarity, gt, k=1)
-        precision_at_5 = retrieval_precision_tensor(similarity, gt, k=5)
-        precision_at_10 = retrieval_precision_tensor(similarity, gt, k=10)
-        
+        # 1. similarity matrix: [N_query, N_candidate]
+        similarity = torch.matmul(query_embeddings, candidate_embeddings.T)
+
+        num_queries = similarity.shape[0]
+        num_candidates = similarity.shape[1]
+
+        # 防止 topk 大于候选数量时报错
+        topk = min(topk, num_candidates)
+        k1 = min(1, num_candidates)
+        k5 = min(5, num_candidates)
+        k10 = min(10, num_candidates)
+
+        # 2. top-k retrieval indices: [N_query, topk]
+        indices = similarity.topk(k=topk, dim=-1).indices
+
+        # 3. ground truth: assume query i matches candidate i
+        # 注意：这里默认 query 和 candidate 是一一对应的
+        gt = torch.arange(num_queries, device=similarity.device)
+
+        # 如果 query 数量大于 candidate 数量，会导致 gt 越界
+        valid_mask = gt < num_candidates
+        if not valid_mask.all():
+            similarity_for_metric = similarity[valid_mask]
+            gt_for_metric = gt[valid_mask]
+        else:
+            similarity_for_metric = similarity
+            gt_for_metric = gt
+
+        # 4. retrieval metrics
+        mrr = reciprocal_rank_tensor(similarity_for_metric, gt_for_metric)
+        precision_at_1 = retrieval_precision_tensor(similarity_for_metric, gt_for_metric, k=k1)
+        precision_at_5 = retrieval_precision_tensor(similarity_for_metric, gt_for_metric, k=k5)
+        precision_at_10 = retrieval_precision_tensor(similarity_for_metric, gt_for_metric, k=k10)
+
         print(f"Retrieval ({retrieval_direction}) results:")
-        print(f"Precision@1: {precision_at_1.item():.4f}, Precision@5: {precision_at_5.item():.4f}, Precision@10: {precision_at_10.item():.4f}")
+        print(
+            f"Precision@1: {precision_at_1.item():.4f}, "
+            f"Precision@5: {precision_at_5.item():.4f}, "
+            f"Precision@10: {precision_at_10.item():.4f}"
+        )
         print(f"MRR: {mrr.item():.4f}")
-        
-        
-        if retrieval_direction == "text2ts":
-            args_list = [
-                (i, pred_idx.item(), query_raw[i], candidate_raw[pred_idx.item()],
-                query_embeddings[i].cpu(), query_embeddings[pred_idx.item()].cpu())
-                for i, pred_idx in enumerate(indices[:, 0])
-            ]
 
+        # 5. Text similarity evaluation: ROUGE-L + cosine similarity
+        cosine_sims = []
+        rouge_scores = []
+
+        args_list = []
+        for i, pred_idx in enumerate(indices[:, 0]):
+            pred_idx = pred_idx.item()
+
+            args_list.append(
+                (
+                    i,
+                    pred_idx,
+                    str(query_raw[i]),
+                    str(candidate_raw[pred_idx]),
+                    query_embeddings[i].detach().cpu(),
+                    candidate_embeddings[pred_idx].detach().cpu(),
+                )
+            )
+
+        if len(args_list) > 0:
             with Pool(processes=8) as pool:
-                results = pool.map(compute_simiarltiy_batch, args_list)
+                results = pool.map(compute_similarity_batch, args_list)
+
             cosine_sims, rouge_scores = zip(*results)
+            cosine_sims = list(cosine_sims)
+            rouge_scores = list(rouge_scores)
 
             print(f"Avg ROUGE Score: {np.mean(rouge_scores):.4f}")
             print(f"Avg Cosine Similarity: {np.mean(cosine_sims):.4f}")
-            
-        # ts distance evaluation (only for ts2text)
-        if retrieval_direction == "ts2text":
-            args_list = [
-                (i, pred_idx.item(), query_raw[i], candidate_raw[pred_idx.item()],
-                candidate_embeddings[i].cpu(), candidate_embeddings[pred_idx.item()].cpu())
-                for i, pred_idx in enumerate(indices[:, 0])
-            ]
+        else:
+            cosine_sims = [0.0]
+            rouge_scores = [0.0]
 
-            with Pool(processes=8) as pool:
-                results = pool.map(compute_simiarltiy_batch, args_list)
-            cosine_sims, rouge_scores = zip(*results)
-
-            print(f"Avg ROUGE Score: {np.mean(rouge_scores):.4f}")
-            print(f"Avg Cosine Similarity: {np.mean(cosine_sims):.4f}")
-
+        # 6. Time-series distance evaluation
         l1_distances = []
         l2_distances = []
-        
-        for i, preds in enumerate(indices[:, 0]):
+
+        for i, pred_idx in enumerate(indices[:, 0]):
+            pred_idx = pred_idx.item()
+
             query_ts = query_timeseries[i]
-            retrieved_ts = candidate_timeseries[preds]
+            retrieved_ts = candidate_timeseries[pred_idx]
+
+            # 防止 query_ts 和 retrieved_ts 不在同一个 device
+            if torch.is_tensor(query_ts) and torch.is_tensor(retrieved_ts):
+                retrieved_ts = retrieved_ts.to(query_ts.device)
+
             l1_dist = torch.abs(query_ts - retrieved_ts).mean().item()
             l2_dist = ((query_ts - retrieved_ts) ** 2).mean().item()
+
             l1_distances.append(l1_dist)
-            l2_distances.append(l2_dist)    
+            l2_distances.append(l2_dist)
+
         print(f"Avg L1 Distance: {np.mean(l1_distances):.4f}")
         print(f"Avg L2 Distance: {np.mean(l2_distances):.4f}")
-        
+
         rouge_score = float(np.mean(rouge_scores))
         cosine_sim = float(np.mean(cosine_sims))
         l1_distance = float(np.mean(l1_distances))
         l2_distance = float(np.mean(l2_distances))
-        
-        precision_at_1_label = compute_precision_at_k(indices, candidate_labels, query_labels, k=1)
-        precision_at_5_label = compute_precision_at_k(indices, candidate_labels, query_labels, k=5)
-        
+
+        # 7. Label-level retrieval metrics
+        precision_at_1_label = compute_precision_at_k(
+            indices, candidate_labels, query_labels, k=1
+        )
+        precision_at_5_label = compute_precision_at_k(
+            indices, candidate_labels, query_labels, k=min(5, indices.shape[1])
+        )
         mrr_label = compute_mrr(indices, candidate_labels, query_labels)
-        
-    
-        print(f"Label Retrieval Accuracy (Top-1): {precision_at_1.item():.4f}, Top-5: {precision_at_5.item():.4f}")
+
+        print(
+            f"Label Retrieval Accuracy (Top-1): {precision_at_1_label.item():.4f}, "
+            f"Top-5: {precision_at_5_label.item():.4f}"
+        )
         print(f"Label Retrieval MRR: {mrr_label.item():.4f}")
-        
+
+        # 8. Logging
         log_dict = {
-            "precision_at_1": precision_at_1.item(), 
-            "precision_at_5": precision_at_5.item(), 
+            "precision_at_1": precision_at_1.item(),
+            "precision_at_5": precision_at_5.item(),
             "precision_at_10": precision_at_10.item(),
-            "mrr": mrr.item(), 
+            "mrr": mrr.item(),
             "precision_at_1_label": precision_at_1_label.item(),
             "precision_at_5_label": precision_at_5_label.item(),
             "mrr_label": mrr_label.item(),
             "rouge_score": rouge_score,
             "cosine_sim": cosine_sim,
             "MAE": l1_distance,
-            "MSE": l2_distance
+            "MSE": l2_distance,
         }
 
         log_path = os.path.join(self.args.result_dir, f"{self.run_name}.txt")
         log_dir = os.path.dirname(log_path)
+
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
 
@@ -220,8 +270,9 @@ class ContextAligning(Tasks):
             f.write(f"\nEpoch {current_epoch} - Retrieval ({retrieval_direction}) results:\n")
             for k, v in log_dict.items():
                 f.write(f"{k}: {v:.4f}\n")
-        
-        return
+
+        return log_dict
+    
     
     def evaluate_log(self, current_epoch=0):
         if self.args.distributed and isinstance(self.test_dataloader.sampler, DistributedSampler):

@@ -45,6 +45,7 @@ use_day_of_year: true
 use_weekday: true
 use_solar_term: false
 domain_name: Agriculture
+num_class: 10
 use_prior_guided_hard_negative: false
 
 

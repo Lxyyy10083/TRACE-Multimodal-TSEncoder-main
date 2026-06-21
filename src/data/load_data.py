@@ -133,8 +133,179 @@ def generate_er(event):
     prompt = f"The weather event is {event_type}. {event_description}"
     return prompt
 
-def load_retrieval_from_parquet(split: str, file_path: str, text_encoder_name: str, device="cuda:0"):
-    file_path_pq = os.path.join(file_path+split, f'{split}.parquet')
+def _encode_or_load_texts(texts, cache_path, text_encoder_name):
+    """Encode retrieval text once and cache it next to the TimeMMD CSV."""
+    if os.path.exists(cache_path):
+        return torch.load(cache_path, map_location="cpu")
+
+    from sentence_transformers import SentenceTransformer
+
+    print(f"Generating text embeddings with {text_encoder_name}...")
+    model = SentenceTransformer(text_encoder_name, trust_remote_code=True)
+    embeddings = model.encode(
+        texts,
+        batch_size=64,
+        show_progress_bar=True,
+        convert_to_tensor=True,
+    ).cpu()
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(embeddings, cache_path)
+    return embeddings
+
+
+def _nonempty_text(value):
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def load_retrieval_from_timemmd_csv(
+    split: str,
+    csv_path: str,
+    text_encoder_name: str,
+    domain_name: str,
+    seq_len_channel: int,
+    n_channels: int,
+):
+    """Build retrieval samples from a TimeMMD row-oriented CSV.
+
+    Each row is paired with a causal numeric history ending at that row.  The
+    returned payload has the same 5-item (train) / 8-item (test) contract as
+    the original parquet loader; temporal metadata is returned separately for
+    RetrievalDataset to attach to TimeseriesData.
+    """
+    print(f"[Retrieval] parquet not found; loading TimeMMD CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
+    df, _ = normalize_csv_date_column(df, csv_path)
+    if "OT" not in df.columns:
+        raise ValueError(f"TimeMMD retrieval CSV must contain OT: {csv_path}")
+    if len(df) < 2:
+        raise ValueError(f"TimeMMD retrieval CSV needs at least 2 valid rows: {csv_path}")
+
+    # OT is always channel zero. Other genuinely numeric columns are retained;
+    # date/text columns are never accidentally converted into model channels.
+    excluded = {"fact", "preds", "date", "Date", "Month", "start_date", "end_date"}
+    numeric_cols = ["OT"]
+    for col in df.columns:
+        if col == "OT" or col in excluded:
+            continue
+        converted = pd.to_numeric(df[col], errors="coerce")
+        if converted.notna().any():
+            numeric_cols.append(col)
+    numeric_cols = numeric_cols[:n_channels]
+
+    numeric = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    numeric = numeric.interpolate(limit_direction="both")
+    numeric = numeric.fillna(numeric.median()).fillna(0.0)
+    values = numeric.to_numpy(dtype=np.float32)
+    if values.shape[1] < n_channels:
+        pad_count = n_channels - values.shape[1]
+        values = np.pad(values, ((0, 0), (0, pad_count)), mode="constant")
+        channel_names = numeric_cols + [f"padding_channel_{i + 1}" for i in range(pad_count)]
+    else:
+        channel_names = numeric_cols
+
+    raw_texts = []
+    for idx, row in df.iterrows():
+        fact = _nonempty_text(row.get("fact"))
+        preds = _nonempty_text(row.get("preds"))
+        date_text = row["date"].strftime("%Y-%m-%d")
+        raw_texts.append(fact or preds or f"{domain_name} observation on {date_text}.")
+
+    time_prior = build_time_prior_features(df, data_name=domain_name, file_path=csv_path)
+    split_at = max(1, min(len(df) - 1, int(len(df) * 0.8)))
+    if split == "train":
+        row_indices = range(0, split_at)
+    elif split in {"test", "val"}:
+        row_indices = range(split_at, len(df))
+    else:
+        raise ValueError(f"Unsupported retrieval split: {split}")
+
+    timeseries, descriptions, dates = [], [], []
+    time_feat_windows, time_weight_windows = [], []
+    for idx in row_indices:
+        begin = max(0, idx - seq_len_channel + 1)
+        timeseries.append(values[begin:idx + 1].T.copy())
+        descriptions.append(raw_texts[idx])
+        dates.append(df.iloc[idx]["date"])
+
+        feat = time_prior["time_feat"][begin:idx + 1]
+        weight = time_prior["time_feat_weight"][begin:idx + 1]
+        pad_len = seq_len_channel - len(feat)
+        time_feat_windows.append(np.pad(feat, ((pad_len, 0), (0, 0))))
+        time_weight_windows.append(np.pad(weight, ((pad_len, 0), (0, 0))))
+
+    channel_descriptions_per_sample = [
+        [f"{domain_name} numeric channel: {name}" for name in channel_names]
+        for _ in descriptions
+    ]
+    flat_channel_descriptions = [
+        text for sample_texts in channel_descriptions_per_sample for text in sample_texts
+    ]
+    events = list(descriptions)
+    labels = np.full((len(descriptions), 1), time_prior["domain_id"], dtype=np.int64)
+
+    encoder_short_name = text_encoder_name.split("/")[-1]
+    cache_dir = os.path.join(os.path.dirname(csv_path), ".retrieval_cache")
+    cache_key = f"{domain_name}_{split}_{encoder_short_name}_l{seq_len_channel}_c{n_channels}"
+    description_emb = _encode_or_load_texts(
+        descriptions, os.path.join(cache_dir, f"description_{cache_key}.pt"), text_encoder_name
+    )
+    channel_description_emb = _encode_or_load_texts(
+        flat_channel_descriptions,
+        os.path.join(cache_dir, f"channels_{cache_key}.pt"),
+        text_encoder_name,
+    ).reshape(len(descriptions), n_channels, -1)
+    event_emb = _encode_or_load_texts(
+        events, os.path.join(cache_dir, f"event_{cache_key}.pt"), text_encoder_name
+    )
+
+    metadata = {
+        "source": "timemmd_csv",
+        "source_path": csv_path,
+        "dates": dates,
+        "time_feat": time_feat_windows,
+        "time_feat_weight": time_weight_windows,
+        "domain_id": time_prior["domain_id"],
+        "channel_names": channel_names,
+    }
+    payload = (timeseries, description_emb, channel_description_emb, event_emb, labels)
+    if split != "train":
+        payload += (descriptions, flat_channel_descriptions, events)
+    return payload, metadata
+
+
+def load_retrieval_from_parquet(
+    split: str,
+    file_path: str,
+    text_encoder_name: str,
+    device="cuda:0",
+    domain_name=None,
+    seq_len_channel=180,
+    n_channels=7,
+    return_metadata=False,
+):
+    file_path_pq = os.path.join(file_path, split, f'{split}.parquet')
+    if not os.path.exists(file_path_pq):
+        if not domain_name:
+            raise FileNotFoundError(
+                f"{file_path_pq} not found and domain_name is not configured for TimeMMD fallback"
+            )
+        data_root = os.path.dirname(os.path.normpath(file_path))
+        csv_path = os.path.join(data_root, "TimeMMD", f"{domain_name}.csv")
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(
+                f"Neither retrieval parquet ({file_path_pq}) nor TimeMMD CSV ({csv_path}) exists"
+            )
+        payload, metadata = load_retrieval_from_timemmd_csv(
+            split=split,
+            csv_path=csv_path,
+            text_encoder_name=text_encoder_name,
+            domain_name=domain_name,
+            seq_len_channel=seq_len_channel,
+            n_channels=n_channels,
+        )
+        return (payload, metadata) if return_metadata else payload
+
+    print(f"[Retrieval] loading parquet: {file_path_pq}")
     df = pd.read_parquet(file_path_pq)
     timeseries = []
     descriptions = []
@@ -211,7 +382,7 @@ def load_retrieval_from_parquet(split: str, file_path: str, text_encoder_name: s
     channel_description_emb = channel_description_emb.reshape(-1, len(keys_to_save), emb_dim)
     assert channel_description_emb.shape[0] == description_emb.shape[0] == event_emb.shape[0]
     if split == "train":
-        return timeseries, description_emb, channel_description_emb, event_emb, labels
+        payload = timeseries, description_emb, channel_description_emb, event_emb, labels
     else:
-        return timeseries, description_emb, channel_description_emb, event_emb, labels, descriptions, channel_descriptions, events
-
+        payload = timeseries, description_emb, channel_description_emb, event_emb, labels, descriptions, channel_descriptions, events
+    return (payload, None) if return_metadata else payload

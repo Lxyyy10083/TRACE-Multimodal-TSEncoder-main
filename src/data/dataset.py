@@ -13,6 +13,7 @@ from src.data.load_data import (
     load_npy_timeseries,
     load_forecasting_from_json,
     load_retrieval_from_parquet,
+    load_retrieval_from_timemmd_csv,
     normalize_csv_date_column,
     build_time_prior_features,
 )
@@ -395,15 +396,31 @@ class RetrievalDataset(TaskDataset):
 
     def _read_data(self) -> TimeseriesData:
         self.scaler = StandardScaler()
-        payload, self.retrieval_metadata = load_retrieval_from_parquet(
-            self.data_split,
+        parquet_path = os.path.join(
             self.root_path,
-            self.text_encoder_name,
-            domain_name=self.domain_name,
-            seq_len_channel=self.seq_len_channel,
-            n_channels=self.n_channels,
-            return_metadata=True,
+            self.data_split,
+            f"{self.data_split}.parquet",
         )
+        if os.path.exists(parquet_path):
+            payload, self.retrieval_metadata = load_retrieval_from_parquet(
+                self.data_split,
+                self.root_path,
+                self.text_encoder_name,
+                return_metadata=True,
+            )
+        else:
+            if not self.domain_name:
+                raise ValueError(
+                    "domain_name is required for TimeMMD CSV retrieval fallback"
+                )
+            payload, self.retrieval_metadata = load_retrieval_from_timemmd_csv(
+                self.data_split,
+                self.root_path,
+                self.domain_name,
+                self.text_encoder_name,
+                seq_len_channel=self.seq_len_channel,
+                n_channels=self.n_channels,
+            )
         if self.data_split == "train":
             self.data, self.descriptions_emb, self.channel_descriptions_emb, self.events_emb, self.labels = payload
         else:

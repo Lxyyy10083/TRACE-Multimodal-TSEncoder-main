@@ -159,11 +159,11 @@ def _nonempty_text(value):
 
 def load_retrieval_from_timemmd_csv(
     split: str,
-    csv_path: str,
-    text_encoder_name: str,
+    root_path: str,
     domain_name: str,
-    seq_len_channel: int,
-    n_channels: int,
+    text_encoder_name: str,
+    seq_len_channel: int = 180,
+    n_channels: int = 7,
 ):
     """Build retrieval samples from a TimeMMD row-oriented CSV.
 
@@ -172,7 +172,22 @@ def load_retrieval_from_timemmd_csv(
     the original parquet loader; temporal metadata is returned separately for
     RetrievalDataset to attach to TimeseriesData.
     """
-    print(f"[Retrieval] parquet not found; loading TimeMMD CSV: {csv_path}")
+    normalized_root = os.path.normpath(root_path)
+    if os.path.basename(normalized_root).lower() == "retrieval":
+        dataset_root = os.path.dirname(normalized_root)
+    elif os.path.basename(normalized_root).lower() == "dataset":
+        dataset_root = normalized_root
+    else:
+        raise ValueError(
+            "TimeMMD retrieval root must be dataset/retrieval or dataset; "
+            f"got: {root_path}"
+        )
+    csv_path = os.path.join(dataset_root, "TimeMMD", f"{domain_name}.csv")
+    display_path = csv_path.replace("\\", "/")
+    print(f"[TimeMMD CSV Retrieval] Loading {display_path}")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"TimeMMD CSV not found: {display_path}")
+
     df = pd.read_csv(csv_path)
     df, _ = normalize_csv_date_column(df, csv_path)
     if "OT" not in df.columns:
@@ -297,9 +312,9 @@ def load_retrieval_from_parquet(
             )
         payload, metadata = load_retrieval_from_timemmd_csv(
             split=split,
-            csv_path=csv_path,
-            text_encoder_name=text_encoder_name,
+            root_path=file_path,
             domain_name=domain_name,
+            text_encoder_name=text_encoder_name,
             seq_len_channel=seq_len_channel,
             n_channels=n_channels,
         )

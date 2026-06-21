@@ -22,6 +22,13 @@ class ForecastFinetuning(Tasks):
         self.args = args
         self._build_model()
         self._logged_time_prior_batch = False
+        self._logged_forecast_shapes = False
+        self.use_direct_text_forecast = (
+            getattr(args, "use_direct_text_forecast", False)
+            and not getattr(args, "ts_only", False)
+        )
+        self._direct_text_log_batches = 0
+        self._logged_direct_text_shapes = False
 
     def _unpack_batch_with_time_prior(self, batch):
         """Support both TimeseriesData batches and tuple batches with time priors."""
@@ -80,10 +87,137 @@ class ForecastFinetuning(Tasks):
             f"domain_id.shape={domain_id.shape}"
         )
         self._logged_time_prior_batch = True
+
+    def _get_direct_text_batch(self, batch_x):
+        text_emb = getattr(batch_x, "text_emb", None)
+        text_mask = getattr(batch_x, "text_mask", None)
+        if not self.use_direct_text_forecast or text_emb is None or text_mask is None:
+            return None, None
+        return text_emb.float().to(self.device), text_mask.float().to(self.device)
+
+    def _log_text_leakage_batch(self, batch_x):
+        if self.args.rank != 0 or self._direct_text_log_batches >= 3:
+            return
+        origins = getattr(batch_x, "forecast_origin_time", None)
+        selected_times = getattr(batch_x, "text_time", None)
+        if origins is None or selected_times is None:
+            return
+        origin = origins[0]
+        selected = selected_times[0]
+        passed = selected is None or selected <= origin
+        print(
+            "[Direct text leakage] "
+            f"forecast_origin_time={origin}, "
+            f"selected_text_time={selected}, passed={passed}"
+        )
+        if getattr(self.args, "use_text_leakage_check", True) and not passed:
+            raise RuntimeError(
+                f"Text leakage detected: {selected} > {origin}"
+            )
+        self._direct_text_log_batches += 1
+
+    def _log_direct_text_shapes_once(self, outputs, text_emb, text_mask):
+        if self._logged_direct_text_shapes or self.args.rank != 0:
+            return
+        print(
+            "[Direct text forecast] "
+            f"use_direct_text_forecast={self.use_direct_text_forecast}, "
+            f"text_data_path={getattr(self.args, 'text_data_path', None)}, "
+            f"text_embedding_path={getattr(self.args, 'text_embedding_path', None)}"
+        )
+        if self.use_direct_text_forecast:
+            print(f"text_emb shape={None if text_emb is None else text_emb.shape}")
+            print(
+                "text_mask sum="
+                f"{None if text_mask is None else text_mask.sum().item()}"
+            )
+            print(f"ts_emb shape={None if outputs.cls_embedding is None else outputs.cls_embedding.shape}")
+            print(f"time_emb shape={None if outputs.time_emb is None else outputs.time_emb.shape}")
+            print(f"fused_emb shape={None if outputs.fused_emb is None else outputs.fused_emb.shape}")
+            gate = outputs.direct_text_gate
+            if gate is not None:
+                print(
+                    "gate mean/min/max="
+                    f"{gate.mean().item():.6f}/"
+                    f"{gate.min().item():.6f}/"
+                    f"{gate.max().item():.6f}"
+                )
+        self._logged_direct_text_shapes = True
+
+    def _validate_forecast_shapes(
+        self,
+        outputs,
+        forecast,
+        time_feat=None,
+        time_feat_weight=None,
+    ):
+        """Reject broadcasting and verify that all future tensors use H steps."""
+        pred = outputs.forecast
+        if pred is None:
+            raise ValueError("Model output does not contain outputs.forecast")
+        if pred.shape != forecast.shape:
+            raise ValueError(
+                f"Forecast shape mismatch: pred={pred.shape}, target={forecast.shape}"
+            )
+        if pred.ndim != 3:
+            raise ValueError(
+                f"Forecast tensors must be [B, C, H], got {pred.shape}"
+            )
+
+        horizon = self.args.forecast_horizon
+        if pred.shape[-1] != horizon:
+            raise ValueError(
+                f"Forecast horizon mismatch: configured={horizon}, got={pred.shape[-1]}"
+            )
+
+        for name, tensor in (
+            ("time_feat", time_feat),
+            ("time_feat_weight", time_feat_weight),
+        ):
+            if tensor is not None and (
+                tensor.ndim != 3
+                or tensor.shape[0] != pred.shape[0]
+                or tensor.shape[1] != horizon
+            ):
+                raise ValueError(
+                    f"{name} must be [B, H, D] with H={horizon}, got {tensor.shape}"
+                )
+
+        if not self._logged_forecast_shapes:
+            if self.args.rank == 0:
+                print(f"outputs.forecast.shape = {list(pred.shape)}")
+                print(f"forecast.shape = {list(forecast.shape)}")
+                print(
+                    "time_feat.shape = "
+                    f"{None if time_feat is None else list(time_feat.shape)}"
+                )
+                print(
+                    "time_feat_weight.shape = "
+                    f"{None if time_feat_weight is None else list(time_feat_weight.shape)}"
+                )
+            self._logged_forecast_shapes = True
+
+    def _save_best_checkpoint(self, checkpoint_path, epoch, val_loss):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "best_epoch": int(epoch),
+                "best_validation_loss": float(val_loss),
+            },
+            checkpoint_path,
+        )
+
+    def _load_best_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        model.load_state_dict(checkpoint["model_state_dict"])
+        return checkpoint
     
     def validation(self, data_loader, return_preds: bool = False):
         trues, preds, histories= [], [], []
-        loss_list = []
+        loss_sum = 0.0
+        sample_count = 0
         self.model.eval()
         with torch.no_grad():
             for batch in tqdm(data_loader, total=len(data_loader)):
@@ -98,6 +232,8 @@ class ForecastFinetuning(Tasks):
                     forecast = batch_y.float().to(self.device)
                 time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
                 self._log_time_prior_batch_once(batch_x, time_feat, domain_id)
+                text_emb, text_mask = self._get_direct_text_batch(batch_x)
+                self._log_text_leakage_batch(batch_x)
 
                 with torch.autocast(
                     device_type="cuda",
@@ -111,25 +247,36 @@ class ForecastFinetuning(Tasks):
                         time_feat=time_feat,
                         time_feat_weight=time_feat_weight,
                         domain_id=domain_id,
+                        text_emb=text_emb,
+                        text_mask=text_mask,
                     )
 
-                loss = self.criterion(outputs.forecast, forecast)
-
-                #### get metrics from all GPUs #####
-                if self.args.world_size > 1:                    
-                    tensor_forecast_loss = torch.tensor(loss, device=self.device)
-                    dist.all_reduce(tensor_forecast_loss, op=dist.ReduceOp.SUM)
-                    loss = (tensor_forecast_loss / self.args.world_size)
-                #### Finish getting metrics from all GPUs #####
-                
-                loss_list.append(loss.item())
+                self._log_direct_text_shapes_once(outputs, text_emb, text_mask)
+                self._validate_forecast_shapes(
+                    outputs,
+                    forecast,
+                    time_feat,
+                    time_feat_weight,
+                )
+                # Aurora-compatible evaluation: MSE in standardized space.
+                # Do not inverse_transform predictions or targets here.
+                loss = torch.mean((outputs.forecast - forecast) ** 2)
+                batch_size = forecast.shape[0]
+                loss_sum += loss.item() * batch_size
+                sample_count += batch_size
                 if return_preds:
                     trues.append(forecast.detach().cpu().numpy())
                     preds.append(outputs.forecast.detach().cpu().numpy())
                     histories.append(timeseries.detach().cpu().numpy())
 
-        forecast_losses = np.array(loss_list)
-        average_forecast_loss = np.average(forecast_losses)
+        loss_stats = torch.tensor(
+            [loss_sum, sample_count],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self.args.world_size > 1:
+            dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+        average_forecast_loss = (loss_stats[0] / loss_stats[1].clamp_min(1)).item()
         average_losses = {"val_loss": average_forecast_loss}
         self.model.train()
         if self.args.debug and self.args.rank == 0:
@@ -145,6 +292,11 @@ class ForecastFinetuning(Tasks):
                 preds = np.concatenate(flatten_nested_list(gathered_preds), axis=0)  # [N, C, H]
                 histories = np.concatenate(flatten_nested_list(gathered_histories), axis=0)  # [N, C, L]
 
+        elif return_preds and self.args.rank == 0:
+            trues = np.concatenate(trues, axis=0)
+            preds = np.concatenate(preds, axis=0)
+            histories = np.concatenate(histories, axis=0)
+
 
         if return_preds:
             if self.args.rank == 0:
@@ -157,30 +309,53 @@ class ForecastFinetuning(Tasks):
     def train(self):
         if self.args.rank == 0:
             self.run_name = self.logger.name
-            path = os.path.join(self.args.checkpoint_path, self.run_name)
+        if self.args.world_size > 1:
+            run_name_holder = [self.run_name if self.args.rank == 0 else None]
+            dist.broadcast_object_list(run_name_holder, src=0)
+            self.run_name = run_name_holder[0]
+
+        path = os.path.join(self.args.checkpoint_path, self.run_name)
+        best_checkpoint_path = os.path.join(path, "best_checkpoint.pth")
+        if self.args.rank == 0:
             make_dir_if_not_exists(path, verbose=True)
             self.results_dir = self._create_results_dir(experiment_name="supervised_forecasting")
+        if self.args.world_size > 1:
+            dist.barrier()
 
         self.optimizer = self._select_optimizer()
-        self.criterion = self._select_criterion(loss_type="huber", delta=1.0)
+        self.criterion = self._select_criterion(loss_type="mse")
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
         self._init_lr_scheduler(type=self.args.lr_scheduler_type)
         
         if self.args.model_name == "TraceEncoder":
             self.load_pretrained_ts_encoder(pretraining_task_name="pretraining", do_not_copy_head=True)
+            if self.use_direct_text_forecast:
+                for name, parameter in self.model.named_parameters():
+                    if "direct_text_fusion" in name:
+                        parameter.requires_grad = True
     
-        self.model.to(self.args.rank)
-        self.model = torch.nn.parallel.DistributedDataParallel(
-            self.model,
-            device_ids=[self.args.rank],
-            find_unused_parameters=getattr(self.args, "use_temporal_prior", False),
-        )
+        self.model.to(self.device)
+        if self.args.world_size > 1:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.args.rank],
+                find_unused_parameters=getattr(
+                    self.args,
+                    "use_temporal_prior",
+                    False,
+                ),
+            )
+            if self.args.rank == 0:
+                print("[DDP] enabled for forecast_finetune")
+        elif self.args.rank == 0:
+            print("[DDP] skipped because world_size=1")
         # self.early_stopping = EarlyStopping(patience=self.args.patience, delta=self.args.delta)
         
         
         opt_steps = 0
         cur_epoch = 0
         best_validation_loss = np.inf
+        best_epoch = None
         while cur_epoch < self.args.max_epoch:
             print(f"Epoch {cur_epoch} of {self.args.max_epoch}")
             self.model.train()
@@ -200,6 +375,8 @@ class ForecastFinetuning(Tasks):
                     forecast = batch_y.float().to(self.device)
                 time_feat, time_feat_weight, domain_id = self._move_time_prior_to_device(time_feat, time_feat_weight, domain_id)
                 self._log_time_prior_batch_once(batch_x, time_feat, domain_id)
+                text_emb, text_mask = self._get_direct_text_batch(batch_x)
+                self._log_text_leakage_batch(batch_x)
                 if not self.args.set_input_mask:
                     input_mask = torch.ones_like(input_mask)
 
@@ -214,9 +391,17 @@ class ForecastFinetuning(Tasks):
                         time_feat=time_feat,
                         time_feat_weight=time_feat_weight,
                         domain_id=domain_id,
+                        text_emb=text_emb,
+                        text_mask=text_mask,
                     )
 
-                
+                self._log_direct_text_shapes_once(outputs, text_emb, text_mask)
+                self._validate_forecast_shapes(
+                    outputs,
+                    forecast,
+                    time_feat,
+                    time_feat_weight,
+                )
                 loss = self.criterion(outputs.forecast, forecast)
                 
                 if self.args.debug:
@@ -246,34 +431,64 @@ class ForecastFinetuning(Tasks):
             
             
             cur_epoch = cur_epoch + 1
-            if cur_epoch % self.args.log_interval == 0:
+            should_validate = (
+                cur_epoch % self.args.log_interval == 0
+                or cur_epoch == self.args.max_epoch
+            )
+            if should_validate:
                 if self.args.distributed and isinstance(self.val_dataloader.sampler, DistributedSampler):
                     self.val_dataloader.sampler.set_epoch(cur_epoch)
                     
-                eval_metrics =self.evaluate_and_log()
+                eval_metrics = self.evaluate_and_log()
+                current_val_loss = eval_metrics.val_loss["val_loss"]
 
-                if eval_metrics.val_loss["val_loss"] < best_validation_loss:
-                    best_validation_loss = eval_metrics.val_loss["val_loss"]
-                    if self.args.rank == 0 and not self.args.debug:
-                        self.save_model(self.model, path, None, self.optimizer, self.scaler)
-                
-                if self.args.distributed and isinstance(self.test_dataloader.sampler, DistributedSampler):
-                    self.test_dataloader.sampler.set_epoch(cur_epoch)                
-                test_loss, (trues, preds, _) = self.validation(self.test_dataloader, return_preds=True)
-                if self.args.rank == 0:
-                    metrics = forecast_metric(preds, trues)
-                    forecasting_table = pd.DataFrame(
-                        data=[self.run_name, self.logger.id, cur_epoch, metrics["mae"], metrics["mse"],metrics["mape"], metrics["smape"], metrics["rmse"]],
-                        index=["Model name", "ID", "Epoch", "MAE", "MSE", "MAPE", "sMAPE", "RMSE"]
-                    )
+                if current_val_loss < best_validation_loss:
+                    best_validation_loss = current_val_loss
+                    best_epoch = cur_epoch
+                    if self.args.rank == 0:
+                        self._save_best_checkpoint(
+                            best_checkpoint_path,
+                            best_epoch,
+                            best_validation_loss,
+                        )
 
-                    self.logger.log({"MAE": metrics["mae"],
-                                    "MSE": metrics["mse"],
-                                    "MAPE": metrics["mape"],
-                                    "sMAPE": metrics["smape"],
-                                    "RMSE": metrics["rmse"],
-                                    "test_loss": test_loss["val_loss"]})
-                    # self.save_results(forecasting_table, self.results_dir)
+        if best_epoch is None:
+            raise RuntimeError("No validation result was produced; best checkpoint is unavailable")
+        if self.args.world_size > 1:
+            dist.barrier()
+
+        best_checkpoint = self._load_best_checkpoint(best_checkpoint_path)
+        best_epoch = int(best_checkpoint["best_epoch"])
+        best_validation_loss = float(best_checkpoint["best_validation_loss"])
+
+        if self.args.distributed and isinstance(self.test_dataloader.sampler, DistributedSampler):
+            self.test_dataloader.sampler.set_epoch(best_epoch)
+        test_loss, (trues, preds, _) = self.validation(
+            self.test_dataloader,
+            return_preds=True,
+        )
+        if self.args.rank == 0:
+            # MMDataset already standardized these arrays with the train-fitted
+            # scaler. Deliberately do not inverse_transform before metrics.
+            metrics = forecast_metric(preds, trues)
+            print("Final Forecast Metrics")
+            print(f"Best epoch: {best_epoch}")
+            print(f"Best validation loss: {best_validation_loss:.6f}")
+            print(f"Test MSE: {metrics['mse']:.6f}")
+            print(f"Test MAE: {metrics['mae']:.6f}")
+            print(f"Test RMSE: {metrics['rmse']:.6f}")
+            self.logger.log(
+                {
+                    "best_epoch": best_epoch,
+                    "best_validation_loss": best_validation_loss,
+                    "test_MAE": metrics["mae"],
+                    "test_MSE": metrics["mse"],
+                    "test_MAPE": metrics["mape"],
+                    "test_sMAPE": metrics["smape"],
+                    "test_RMSE": metrics["rmse"],
+                    "test_loss": test_loss["val_loss"],
+                }
+            )
         
         return self.model
 

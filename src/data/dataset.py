@@ -1,6 +1,7 @@
 import logging
 import os
 import warnings
+import ast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -513,12 +514,35 @@ class MMDataset(TaskDataset):
         data_split: str = "train",
         scale: bool = True,
         task_name: str = TASKS.PRETRAINING,
+        use_direct_text_forecast: bool = False,
+        text_data_path: str = None,
+        text_date_col: str = "date",
+        text_col: str = "text",
+        text_encoder_type: str = "offline_embedding",
+        text_embedding_path: str = None,
+        text_emb_dim: int = 768,
+        lookback_text_window=None,
+        use_text_leakage_check: bool = True,
         **kwargs,
     ):
         super(MMDataset, self).__init__()
         self.seq_len = seq_len_channel
         self.label_len = forecast_len
         self.pred_len = forecast_len
+        self.task_name = task_name
+        self.use_direct_text_forecast = (
+            bool(use_direct_text_forecast) and task_name == "forecasting"
+        )
+        self.text_data_path = text_data_path
+        self.text_date_col = text_date_col
+        self.text_col = text_col
+        self.text_encoder_type = text_encoder_type
+        self.text_embedding_path = text_embedding_path
+        self.text_emb_dim = int(text_emb_dim)
+        self.lookback_text_window = lookback_text_window
+        self.use_text_leakage_check = bool(use_text_leakage_check)
+        self._text_dates = None
+        self._text_embeddings = None
         assert data_split in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
         self.set_type = type_map[data_split]
@@ -530,7 +554,163 @@ class MMDataset(TaskDataset):
         self.root_path, self.data_path = self._resolve_csv_path(root_path, data_name)
         self._logged_time_prior_sample = False
         self.__read_data__()
+        self._load_direct_text_data()
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def _load_embedding_array(self, embedding_path):
+        extension = os.path.splitext(embedding_path)[1].lower()
+        if extension == ".npy":
+            return np.load(embedding_path)
+        if extension == ".npz":
+            archive = np.load(embedding_path)
+            key = "embeddings" if "embeddings" in archive.files else archive.files[0]
+            return archive[key]
+        if extension in {".pt", ".pth"}:
+            value = torch.load(embedding_path, map_location="cpu")
+            if isinstance(value, dict):
+                for key in ("embeddings", "text_emb", "text_embeddings"):
+                    if key in value:
+                        value = value[key]
+                        break
+            if torch.is_tensor(value):
+                value = value.detach().cpu().numpy()
+            return np.asarray(value)
+        if extension == ".csv":
+            embedding_df = pd.read_csv(embedding_path)
+            numeric_df = embedding_df.select_dtypes(include=[np.number])
+            return numeric_df.to_numpy()
+        raise ValueError(f"Unsupported text embedding format: {embedding_path}")
+
+    def _load_direct_text_data(self):
+        if not self.use_direct_text_forecast:
+            return
+        if self.text_encoder_type != "offline_embedding":
+            print(
+                "[Direct text][warning] only offline_embedding is supported; "
+                "falling back to time-series-only samples."
+            )
+            return
+        if not self.text_data_path:
+            print(
+                "[Direct text][warning] text_data_path is null; "
+                "all samples will use text_mask=0."
+            )
+            return
+
+        try:
+            text_df = pd.read_csv(self.text_data_path)
+            if self.text_date_col not in text_df.columns:
+                raise ValueError(
+                    f"Missing text date column '{self.text_date_col}'"
+                )
+            resolved_text_col = self.text_col
+            if resolved_text_col not in text_df.columns and "fact" in text_df.columns:
+                resolved_text_col = "fact"
+            if resolved_text_col not in text_df.columns:
+                raise ValueError(
+                    f"Missing text column '{self.text_col}' and fallback 'fact'"
+                )
+            text_dates = pd.to_datetime(
+                text_df[self.text_date_col],
+                errors="coerce",
+            )
+            text_available = (
+                text_df[resolved_text_col].notna()
+                & text_df[resolved_text_col].astype(str).str.strip().ne("")
+            )
+            valid = (text_dates.notna() & text_available).to_numpy()
+            text_df = text_df.loc[valid].reset_index(drop=True)
+            text_dates = text_dates.loc[valid].reset_index(drop=True)
+
+            if self.text_embedding_path:
+                embeddings = self._load_embedding_array(self.text_embedding_path)
+                if len(embeddings) != len(valid):
+                    raise ValueError(
+                        "text embedding rows must match the original text CSV rows: "
+                        f"{len(embeddings)} != {len(valid)}"
+                    )
+                embeddings = np.asarray(embeddings)[valid]
+            elif "text_emb" in text_df.columns:
+                embeddings = np.stack(
+                    [
+                        np.asarray(ast.literal_eval(str(value)), dtype=np.float32)
+                        for value in text_df["text_emb"]
+                    ]
+                )
+            else:
+                embedding_cols = [
+                    column
+                    for column in text_df.columns
+                    if column.startswith("emb_") or column.startswith("embedding_")
+                ]
+                if not embedding_cols:
+                    print(
+                        "[Direct text][warning] no offline embeddings found; "
+                        "raw text is not encoded during training and text_mask will be 0."
+                    )
+                    return
+                embeddings = text_df[embedding_cols].to_numpy(dtype=np.float32)
+
+            embeddings = np.asarray(embeddings, dtype=np.float32)
+            if embeddings.ndim != 2 or embeddings.shape[1] != self.text_emb_dim:
+                raise ValueError(
+                    f"Expected text embeddings [N, {self.text_emb_dim}], "
+                    f"got {embeddings.shape}"
+                )
+
+            order = np.argsort(text_dates.to_numpy(dtype="datetime64[ns]"))
+            self._text_dates = text_dates.iloc[order].reset_index(drop=True)
+            self._text_embeddings = embeddings[order]
+            print(
+                "[Direct text] loaded offline embeddings: "
+                f"rows={len(self._text_dates)}, dim={self.text_emb_dim}, "
+                f"text_data_path={self.text_data_path}, "
+                f"text_embedding_path={self.text_embedding_path}"
+            )
+        except Exception as error:
+            self._text_dates = None
+            self._text_embeddings = None
+            print(
+                "[Direct text][warning] failed to load text data; "
+                f"falling back to text_mask=0. error={error}"
+            )
+
+    def _select_text_for_origin(self, forecast_origin_time):
+        zero_embedding = np.zeros(self.text_emb_dim, dtype=np.float32)
+        if self._text_dates is None or self._text_embeddings is None:
+            return zero_embedding, np.float32(0.0), None
+
+        origin = pd.Timestamp(forecast_origin_time)
+        text_dates_np = self._text_dates.to_numpy(dtype="datetime64[ns]")
+        right = np.searchsorted(
+            text_dates_np,
+            origin.to_datetime64(),
+            side="right",
+        )
+        if right == 0:
+            return zero_embedding, np.float32(0.0), None
+
+        selected_indices = np.array([right - 1])
+        if self.lookback_text_window not in {None, "", 0, "0"}:
+            window = self.lookback_text_window
+            if isinstance(window, (int, float)):
+                window = pd.Timedelta(days=float(window))
+            else:
+                window = pd.Timedelta(window)
+            left_time = (origin - window).to_datetime64()
+            left = np.searchsorted(text_dates_np, left_time, side="left")
+            selected_indices = np.arange(left, right)
+            if len(selected_indices) == 0:
+                return zero_embedding, np.float32(0.0), None
+
+        selected_time = self._text_dates.iloc[selected_indices[-1]]
+        if self.use_text_leakage_check and selected_time > origin:
+            raise RuntimeError(
+                "Text leakage detected: "
+                f"text_time={selected_time} > forecast_origin_time={origin}"
+            )
+        embedding = self._text_embeddings[selected_indices].mean(axis=0)
+        return embedding.astype(np.float32), np.float32(1.0), selected_time
 
     def _resolve_csv_path(self, root_path, data_name):
         root_path = root_path or ""
@@ -679,8 +859,16 @@ class MMDataset(TaskDataset):
         s_begin = index % self.tot_len
 
         s_end = s_begin + self.seq_len
-        r_begin = s_end - self.label_len
-        r_end = r_begin + self.label_len + self.pred_len
+        if self.task_name == "forecasting":
+            # Forecast fine-tuning consumes only the future prediction range.
+            r_begin = s_end
+            r_end = s_end + self.pred_len
+            expected_time_len = self.pred_len
+        else:
+            # Preserve the existing context + future layout for other MMD tasks.
+            r_begin = s_end - self.label_len
+            r_end = r_begin + self.label_len + self.pred_len
+            expected_time_len = self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end, feat_id:feat_id + 1].reshape(1, -1)
 
@@ -705,25 +893,48 @@ class MMDataset(TaskDataset):
             r_begin,
             r_end,
         )
-        expected_time_len = self.label_len + self.pred_len
+        expected_target_len = (
+            self.pred_len if self.task_name == "forecasting" else expected_time_len
+        )
+        assert seq_y.shape[-1] == expected_target_len, (
+            f"forecast target length must be {expected_time_len}, got {seq_y.shape[-1]}"
+        )
         assert time_feat.ndim == 2, f"time_feat must be [T, D], got {time_feat.shape}"
         assert time_feat_weight.shape == time_feat.shape, (
             "time_feat_weight must match time_feat shape, "
             f"got {time_feat_weight.shape} vs {time_feat.shape}"
         )
         assert time_feat.shape[0] == expected_time_len, (
-            f"time_feat length must be label_len + pred_len={expected_time_len}, "
+            f"time_feat length must be forecast range={expected_time_len}, "
             f"got {time_feat.shape[0]}"
         )
         assert isinstance(self.domain_id, (int, np.integer)), (
             f"domain_id must be an integer, got {type(self.domain_id)}"
         )
         if not self._logged_time_prior_sample:
-            print(
-                "[MMDataset] time prior sample ready: "
-                f"time_feat_shape={time_feat.shape}, domain_id={int(self.domain_id)}"
-            )
+            if self.task_name == "forecasting":
+                print(
+                    "[Forecast dataset] "
+                    f"history_len={seq_x.shape[-1]}, "
+                    f"forecast_horizon={self.pred_len}, "
+                    f"target_shape={seq_y.shape}, "
+                    f"time_feat_shape={time_feat.shape}"
+                )
+            else:
+                print(
+                    "[MMDataset] time prior sample ready: "
+                    f"time_feat_shape={time_feat.shape}, "
+                    f"domain_id={int(self.domain_id)}"
+                )
             self._logged_time_prior_sample = True
+
+        forecast_origin_time = pd.Timestamp(self.date[s_end - 1, 0])
+        if self.use_direct_text_forecast:
+            text_emb, text_mask, text_time = self._select_text_for_origin(
+                forecast_origin_time
+            )
+        else:
+            text_emb, text_mask, text_time = None, None, None
 
         return TimeseriesData(
             timeseries=seq_x,
@@ -733,6 +944,10 @@ class MMDataset(TaskDataset):
             time_feat=time_feat,
             time_feat_weight=time_feat_weight,
             domain_id=np.array(self.domain_id, dtype=np.int64),
+            text_emb=text_emb,
+            text_mask=text_mask,
+            text_time=text_time,
+            forecast_origin_time=forecast_origin_time,
         )
 
     def __len__(self):

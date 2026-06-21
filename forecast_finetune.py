@@ -29,7 +29,8 @@ def main_worker():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/finetune.yaml")
     parser.add_argument("--pretraining_run_name", type=str, default="")
-    parser.add_argument("--forecast_horizon", type=int, default=24)
+    parser.add_argument("--data_name", type=str, default=None)
+    parser.add_argument("--forecast_horizon", type=int, default=None)
     parser.add_argument("--train_batch_size", type=int, default=64)
     parser.add_argument("--val_batch_size", type=int, default=64)
     parser.add_argument("--finetuning_mode", type=str, default="linear-probing")
@@ -38,6 +39,13 @@ def main_worker():
     parser.add_argument("--save_model", action="store_true", default=False)
     parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--ts_only", action="store_true", default=False)
+    parser.add_argument(
+        "--use_direct_text_forecast",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--text_data_path", type=str, default=None)
+    parser.add_argument("--text_embedding_path", type=str, default=None)
     parser.add_argument("--debug", action="store_true", default=False)
     add_time_prior_args(parser)
     args_cmd = parser.parse_args()
@@ -62,7 +70,10 @@ def main_worker():
     
     args.task_name = "forecasting"
     args.pretraining_run_name = args_cmd.pretraining_run_name
-    args.forecast_horizon = args_cmd.forecast_horizon
+    if args_cmd.data_name is not None:
+        args.data_name = args_cmd.data_name
+    if args_cmd.forecast_horizon is not None:
+        args.forecast_horizon = args_cmd.forecast_horizon
     args.train_batch_size = args_cmd.train_batch_size
     args.val_batch_size = args_cmd.val_batch_size
     args.finetuning_mode = args_cmd.finetuning_mode
@@ -71,6 +82,14 @@ def main_worker():
     args.save_model = args_cmd.save_model
     args.top_k = args_cmd.top_k
     args.ts_only = args_cmd.ts_only
+    if args_cmd.use_direct_text_forecast is not None:
+        args.use_direct_text_forecast = args_cmd.use_direct_text_forecast
+    if args_cmd.text_data_path is not None:
+        args.text_data_path = args_cmd.text_data_path
+    if args_cmd.text_embedding_path is not None:
+        args.text_embedding_path = args_cmd.text_embedding_path
+    if args.ts_only:
+        args.use_direct_text_forecast = False
     args.debug = args_cmd.debug
     args = resolve_time_prior_config(args)
     

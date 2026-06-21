@@ -45,6 +45,25 @@ TIME_FEATURE_NAMES = [
 
 BASE_FEATURE_WEIGHT = 1.0
 FOCUS_FEATURE_WEIGHT = 2.0
+_LOGGED_AGRICULTURE_MONTHLY_WEIGHT = False
+
+AGRICULTURE_MONTHLY_WEIGHTS = np.array(
+    [
+        1.0,  # month
+        0.8,  # quarter
+        1.0,  # season
+        0.8,  # day_of_year_sin
+        0.8,  # day_of_year_cos
+        0.0,  # weekday
+        0.0,  # is_weekend
+        0.0,  # week_of_year
+        0.0,  # hour_sin
+        0.0,  # hour_cos
+        0.3,  # solar_term_id
+        0.2,  # heating_or_cooling_season
+    ],
+    dtype=np.float32,
+)
 
 
 def infer_domain_name(data_name=None, file_path=None):
@@ -133,6 +152,15 @@ def _domain_focus_feature_names(domain_name, granularity):
 
 def _build_feature_weight(domain_name, granularity):
     """Create a domain-specific weight vector with the same order as features."""
+    if domain_name == "Agriculture" and granularity == "monthly":
+        weights = AGRICULTURE_MONTHLY_WEIGHTS.copy()
+        focus_names = [
+            name
+            for name, weight in zip(TIME_FEATURE_NAMES, weights)
+            if weight > 0
+        ]
+        return weights, focus_names
+
     weights = np.full(len(TIME_FEATURE_NAMES), BASE_FEATURE_WEIGHT, dtype=np.float32)
     focus_names = _domain_focus_feature_names(domain_name, granularity)
     for feature_name in focus_names:
@@ -192,6 +220,20 @@ def build_time_prior_features(df, data_name=None, file_path=None):
     )
     base_weight, focus_names = _build_feature_weight(domain_name, granularity)
     time_feat_weight = np.repeat(base_weight.reshape(1, -1), len(df), axis=0)
+
+    global _LOGGED_AGRICULTURE_MONTHLY_WEIGHT
+    if (
+        domain_name == "Agriculture"
+        and granularity == "monthly"
+        and not _LOGGED_AGRICULTURE_MONTHLY_WEIGHT
+    ):
+        print(
+            "[Time prior weight] "
+            f"domain={domain_name}, "
+            f"mean_weight={base_weight.mean():.6f}, "
+            f"weights={[round(float(weight), 3) for weight in base_weight]}"
+        )
+        _LOGGED_AGRICULTURE_MONTHLY_WEIGHT = True
 
     print(f"[Time prior] domain: {domain_name} (id={domain_id})")
     if len(dates.dropna()) > 0:

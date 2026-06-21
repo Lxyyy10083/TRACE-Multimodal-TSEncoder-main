@@ -36,6 +36,8 @@ class ContextAligning(Tasks):
         self.model = MultiModalEncoder(args)
         self.num_negatives = args.num_negatives
         self._logged_time_prior_batch = False
+        self._logged_missing_reconstruction = False
+        self._logged_time_conditioned_alignment = False
 
     def _unpack_batch_with_time_prior(self, batch):
         """Support both TimeseriesData batches and tuple batches with time priors."""
@@ -101,6 +103,50 @@ class ContextAligning(Tasks):
         if hasattr(model, "prior_calibrated_logits"):
             return model.prior_calibrated_logits(ts_emb, text_emb, prior_emb, tau=tau)
         return torch.matmul(ts_emb, text_emb.T) / tau
+
+    def _time_conditioned_alignment_loss(self, outputs, time_feat=None):
+        enabled = getattr(self.args, "use_time_conditioned_alignment", False)
+        lambda_time_align = getattr(self.args, "lambda_time_align", 0.1)
+        if not enabled:
+            loss = outputs.embeddings.sum() * 0.0
+        else:
+            if outputs.compatibility_logits is None or outputs.prior_logits is None:
+                raise ValueError(
+                    "Time-conditioned alignment is enabled, but compatibility "
+                    "logits were not produced. Check time_feat, "
+                    "time_feat_weight, domain_id, and description_emb."
+                )
+            targets = torch.arange(
+                outputs.compatibility_logits.shape[0],
+                device=outputs.compatibility_logits.device,
+            )
+            loss = self.contrastive_criterion(
+                outputs.compatibility_logits,
+                targets,
+            )
+
+        if not self._logged_time_conditioned_alignment:
+            if self.args.rank == 0:
+                print(
+                    "[Time-conditioned alignment] "
+                    f"use_time_conditioned_alignment={enabled}"
+                )
+                if enabled:
+                    print(f"ts_emb shape={outputs.embeddings.shape}")
+                    print(f"text_emb shape={outputs.description_emb.shape}")
+                    print(
+                        "time_feat shape="
+                        f"{None if time_feat is None else time_feat.shape}"
+                    )
+                    print(f"prior_logits shape={outputs.prior_logits.shape}")
+                    print(
+                        "final_logits shape="
+                        f"{outputs.compatibility_logits.shape}"
+                    )
+                    print(f"lambda_time_align={lambda_time_align}")
+                    print(f"prior_alpha={getattr(self.args, 'prior_alpha', 0.1)}")
+            self._logged_time_conditioned_alignment = True
+        return loss
     
     def compute_retrieval_metrics(self,
                                 query_embeddings, 
@@ -384,7 +430,28 @@ class ContextAligning(Tasks):
         self._init_lr_scheduler(type=self.args.lr_scheduler_type)
         
         self.model.to(self.args.rank)
-        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.args.rank],find_unused_parameters=True)
+        try:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.args.rank],
+                find_unused_parameters=True,
+                static_graph=True,
+            )
+        except TypeError:
+            # Compatibility with PyTorch versions whose DDP constructor does
+            # not yet expose the static_graph keyword.
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.args.rank],
+                find_unused_parameters=True,
+            )
+            if not hasattr(self.model, "_set_static_graph"):
+                raise RuntimeError(
+                    "This PyTorch version does not support DDP static graphs"
+                )
+            self.model._set_static_graph()
+        if self.args.rank == 0:
+            print("[DDP] static_graph enabled for context_align")
         
         opt_steps = 0
         cur_epoch = 0
@@ -427,9 +494,23 @@ class ContextAligning(Tasks):
 
                 
                 if hasattr(self.args, "model_name") and self.args.model_name.lower() in ["moment", "time-moe", "timer", "chronos"]:
-                    loss = self._get_loss_tsfm(outputs, timeseries, labels, input_mask, opt_steps)
+                    loss = self._get_loss_tsfm(
+                        outputs,
+                        timeseries,
+                        labels,
+                        input_mask,
+                        opt_steps,
+                        time_feat=time_feat,
+                    )
                 else:
-                    loss = self._get_loss(outputs, timeseries, labels, input_mask, opt_steps)
+                    loss = self._get_loss(
+                        outputs,
+                        timeseries,
+                        labels,
+                        input_mask,
+                        opt_steps,
+                        time_feat=time_feat,
+                    )
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
@@ -459,12 +540,37 @@ class ContextAligning(Tasks):
                     print(f"Saved new best checkpoint to {best_checkpoint_path}")
         return self.model
 
-    def _get_loss(self, outputs, timeseries, labels, input_mask, opt_steps):
+    def _get_loss(
+        self,
+        outputs,
+        timeseries,
+        labels,
+        input_mask,
+        opt_steps,
+        time_feat=None,
+    ):
         B, C, L = timeseries.shape
-        recon_loss = self.forecast_criterion(outputs.reconstruction, timeseries)  #[B, C, L]
-        observed_mask = input_mask * (1 - outputs.pretrain_mask)  #[B, C, L]
-        masked_loss = observed_mask * recon_loss  #[B, C, L]
-        recon_loss = masked_loss.nansum() / (observed_mask.nansum() + 1e-7)  #[B, C, L]
+        if outputs.reconstruction is None:
+            # Keep a scalar on the active graph/device so total loss and AMP
+            # backward do not depend on a reconstruction head being present.
+            recon_loss = outputs.embeddings.sum() * 0.0
+            if not self._logged_missing_reconstruction:
+                if getattr(self.args, "rank", 0) == 0:
+                    print(
+                        "[ContextAligning] outputs.reconstruction is None; "
+                        "skip reconstruction loss."
+                    )
+                self._logged_missing_reconstruction = True
+        else:
+            recon_element_loss = self.forecast_criterion(
+                outputs.reconstruction,
+                timeseries,
+            )  # [B, C, L]
+            observed_mask = input_mask * (1 - outputs.pretrain_mask)  # [B, C, L]
+            masked_loss = observed_mask * recon_element_loss  # [B, C, L]
+            recon_loss = masked_loss.nansum() / (
+                observed_mask.nansum() + 1e-7
+            )
         labeled_mask =(labels != -100)
         if labeled_mask.any():
             classification_loss = self.classification_criterion(outputs.classification, labels)  #[B, n_classes]
@@ -623,7 +729,16 @@ class ContextAligning(Tasks):
 
             loss_event = (loss_fwd + loss_bwd) / 2
         
-        loss = recon_loss + classification_loss + loss_channel + loss_global + loss_event
+        time_align_loss = self._time_conditioned_alignment_loss(outputs, time_feat)
+        lambda_time_align = getattr(self.args, "lambda_time_align", 0.1)
+        loss = (
+            recon_loss
+            + classification_loss
+            + loss_channel
+            + loss_global
+            + loss_event
+            + lambda_time_align * time_align_loss
+        )
         
         if self.args.rank == 0 and opt_steps % 30 == 0:
             self.logger.log(
@@ -634,6 +749,7 @@ class ContextAligning(Tasks):
                     "train_loss_channel": loss_channel.item(),
                     "train_loss_global": loss_global.item(),
                     "train_loss_event": loss_event.item(),
+                    "train_loss_time_align": time_align_loss.item(),
                     "learning_rate": self.optimizer.param_groups[0]["lr"],
             }
         )
@@ -651,7 +767,15 @@ class ContextAligning(Tasks):
         return loss
     
 
-    def _get_loss_tsfm(self, outputs, timeseries, labels, input_mask, opt_steps):
+    def _get_loss_tsfm(
+        self,
+        outputs,
+        timeseries,
+        labels,
+        input_mask,
+        opt_steps,
+        time_feat=None,
+    ):
         B, C, L = timeseries.shape
         labeled_mask =(labels != -100)
         if labeled_mask.any():
@@ -758,7 +882,14 @@ class ContextAligning(Tasks):
 
             loss_event = (loss_fwd + loss_bwd) / 2
         
-        loss = classification_loss + loss_global + loss_event
+        time_align_loss = self._time_conditioned_alignment_loss(outputs, time_feat)
+        lambda_time_align = getattr(self.args, "lambda_time_align", 0.1)
+        loss = (
+            classification_loss
+            + loss_global
+            + loss_event
+            + lambda_time_align * time_align_loss
+        )
         
         if self.args.rank == 0 and opt_steps % 30 == 0:
             self.logger.log(
@@ -767,6 +898,7 @@ class ContextAligning(Tasks):
                     "train_classification_loss": classification_loss.item(),
                     "train_loss_global": loss_global.item(),
                     "train_loss_event": loss_event.item(),
+                    "train_loss_time_align": time_align_loss.item(),
                     "learning_rate": self.optimizer.param_groups[0]["lr"],
             }
         )

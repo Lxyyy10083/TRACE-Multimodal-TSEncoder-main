@@ -26,6 +26,10 @@ class TimeseriesData:
     time_feat: npt.NDArray = None
     time_feat_weight: npt.NDArray = None
     domain_id: Union[npt.NDArray, int] = None
+    text_emb: npt.NDArray = None
+    text_mask: Union[npt.NDArray, int, float] = None
+    text_time: object = None
+    forecast_origin_time: object = None
 
 
 @dataclass
@@ -45,6 +49,12 @@ class TimeseriesOutputs:
     event_emb: torch.Tensor = None
     channel_description_emb: torch.Tensor = None
     prior_emb: torch.Tensor = None
+    compatibility_logits: torch.Tensor = None
+    prior_logits: torch.Tensor = None
+    text_time_gate: torch.Tensor = None
+    direct_text_gate: torch.Tensor = None
+    fused_emb: torch.Tensor = None
+    time_emb: torch.Tensor = None
 
 
 

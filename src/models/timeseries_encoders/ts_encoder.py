@@ -13,6 +13,7 @@ from src.models.layers.revin import RevIN
 from src.models.layers.prediction_head import ForecastingHead, ReconstructionHead, EmbeddingHead, RetrievalAugmentedHead
 from src.models.layers.get_encoder import get_transformer_backbone
 from src.models.layers.time_prior import TemporalPriorEncoder
+from src.models.layers.text_forecast_fusion import DirectTextForecastFusion
 from src.data.time_prior_features import TIME_FEATURE_NAMES
 
 class TS_Encoder(nn.Module):
@@ -77,6 +78,28 @@ class TS_Encoder(nn.Module):
             )
         else:
             self.temporal_prior_encoder = None
+
+        self.use_direct_text_forecast = (
+            configs.getattr("use_direct_text_forecast", False)
+            and not configs.getattr("ts_only", False)
+            and self.task_name == TASKS.FORECASTING
+        )
+        if self.use_direct_text_forecast:
+            fusion_type = configs.getattr("text_fusion_type", "gated_residual")
+            if fusion_type != "gated_residual":
+                raise ValueError(
+                    f"Unsupported text_fusion_type={fusion_type}; "
+                    "expected gated_residual"
+                )
+            self.direct_text_fusion = DirectTextForecastFusion(
+                d_model=configs.d_model,
+                text_emb_dim=configs.getattr("text_emb_dim", 768),
+                hidden_dim=configs.getattr("prior_hidden_dim", None),
+                dropout=configs.getattr("prior_dropout", configs.getattr("dropout", 0.1)),
+                text_residual_alpha=configs.getattr("text_residual_alpha", 0.05),
+            )
+        else:
+            self.direct_text_fusion = None
 
         # Prediction Head
         self.head = self._get_head(self.task_name)
@@ -417,17 +440,50 @@ class TS_Encoder(nn.Module):
 
         # Decoder
         prior_emb = None
+        time_emb = None
+        ts_emb = None
+        fused_emb = None
+        direct_text_gate = None
         use_cls_context = False
         if self.dec_shape == "BTD":
+            ts_emb = enc_out[:, 0, :]
             h_cls, prior_emb = self._apply_temporal_prior_to_cls(
-                enc_out[:, 0, :],
+                ts_emb,
                 time_feat=kwargs.get("time_feat", None),
                 time_feat_weight=kwargs.get("time_feat_weight", None),
                 domain_id=kwargs.get("domain_id", None),
             )
+            time_emb = (
+                prior_emb
+                if prior_emb is not None
+                else torch.zeros_like(h_cls)
+            )
+            fused_emb = h_cls
+            text_residual = None
+            if (
+                self.direct_text_fusion is not None
+                and kwargs.get("text_emb", None) is not None
+                and kwargs.get("text_mask", None) is not None
+            ):
+                fused_emb, direct_text_gate = self.direct_text_fusion(
+                    ts_emb=h_cls,
+                    text_emb=kwargs["text_emb"].to(h_cls.device),
+                    time_emb=time_emb,
+                    text_mask=kwargs["text_mask"].to(h_cls.device),
+                )
+                text_residual = fused_emb - h_cls
+
             if prior_emb is not None:
                 enc_out = enc_out.clone()
-                enc_out[:, 0, :] = h_cls
+                enc_out[:, 0, :] = (
+                    fused_emb if text_residual is not None else h_cls
+                )
+                use_cls_context = True
+            elif text_residual is not None:
+                # Inject only the bounded residual. For text_mask=0 this is
+                # exactly zero, preserving the original TS-only forecast.
+                enc_out = enc_out.clone()
+                enc_out[:, 0, :] = text_residual
                 use_cls_context = True
 
         dec_out = self.head(
@@ -453,6 +509,10 @@ class TS_Encoder(nn.Module):
             input_mask=input_mask,
             forecast=dec_out,
             prior_emb=prior_emb,
+            cls_embedding=ts_emb,
+            fused_emb=fused_emb,
+            direct_text_gate=direct_text_gate,
+            time_emb=time_emb,
         )
 
     def rag_forecasting(

@@ -61,6 +61,19 @@ def _collate_fn_forecasting(examples):
         domain_id = [int(np.asarray(example.domain_id).item()) for example in examples]
         batch_kwargs["domain_id"] = torch.tensor(domain_id, dtype=torch.long)  # [B]
         assert batch_kwargs["domain_id"].dtype == torch.long, "domain_id must be int64"
+
+    if examples[0].text_emb is not None:
+        batch_kwargs["text_emb"] = torch.stack(
+            [torch.from_numpy(example.text_emb) for example in examples]
+        )
+        batch_kwargs["text_mask"] = torch.tensor(
+            [float(example.text_mask) for example in examples],
+            dtype=torch.float32,
+        )
+        batch_kwargs["text_time"] = [example.text_time for example in examples]
+        batch_kwargs["forecast_origin_time"] = [
+            example.forecast_origin_time for example in examples
+        ]
     
     if examples[0].prior_y is not None:
         prior_y = [torch.from_numpy(example.prior_y) for example in examples] # [C, H]
@@ -211,7 +224,18 @@ def get_mmd_dataloader(args):
         forecast_len=args.forecast_horizon,
         data_name=args.data_name,
         data_split=args.data_split,
-        scale=args.scale)
+        scale=args.scale,
+        task_name=args.task_name,
+        use_direct_text_forecast=getattr(args, "use_direct_text_forecast", False),
+        text_data_path=getattr(args, "text_data_path", None),
+        text_date_col=getattr(args, "text_date_col", "date"),
+        text_col=getattr(args, "text_col", "text"),
+        text_encoder_type=getattr(args, "text_encoder_type", "offline_embedding"),
+        text_embedding_path=getattr(args, "text_embedding_path", None),
+        text_emb_dim=getattr(args, "text_emb_dim", 768),
+        lookback_text_window=getattr(args, "lookback_text_window", None),
+        use_text_leakage_check=getattr(args, "use_text_leakage_check", True),
+    )
     
     if args.world_size > 1:
         dataloader = DataLoader(

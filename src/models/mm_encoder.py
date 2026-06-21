@@ -18,6 +18,10 @@ from src.models.layers.prediction_head import (
     RetrievalAugmentedHead
 )
 from src.models.layers.get_encoder import get_transformer_backbone
+from src.models.layers.time_conditioned_alignment import (
+    TimeConditionedCompatibilityScorer,
+)
+from src.data.time_prior_features import TIME_FEATURE_NAMES
 from src.models.timeseries_encoders.ts_encoder import TS_Encoder as TimeSeriesEncoder
 
 
@@ -311,6 +315,29 @@ class MultiModalEncoder(nn.Module):
             dropout=configs.getattr("prior_dropout", configs.getattr("dropout", 0.1)),
         )
         self._logged_prior_logits = False
+        self.use_time_conditioned_alignment = configs.getattr(
+            "use_time_conditioned_alignment",
+            False,
+        )
+        if self.use_time_conditioned_alignment:
+            prior_input_dim = configs.getattr("prior_input_dim", None)
+            if prior_input_dim is None:
+                prior_input_dim = len(TIME_FEATURE_NAMES)
+            self.time_conditioned_alignment = TimeConditionedCompatibilityScorer(
+                d_model=configs.d_model,
+                prior_input_dim=prior_input_dim,
+                num_domains=configs.getattr("num_domains", 10),
+                domain_emb_dim=configs.getattr("domain_emb_dim", 32),
+                hidden_dim=configs.getattr("prior_hidden_dim", None),
+                dropout=configs.getattr(
+                    "prior_dropout",
+                    configs.getattr("dropout", 0.1),
+                ),
+                temperature=configs.getattr("time_align_temperature", 0.07),
+                prior_alpha=configs.getattr("prior_alpha", 0.1),
+            )
+        else:
+            self.time_conditioned_alignment = None
 
     def prior_calibrated_logits(self, ts_emb, text_emb, prior_emb=None, tau=0.07):
         """
@@ -369,6 +396,29 @@ class MultiModalEncoder(nn.Module):
         if event_emb is not None:
             event_emb = self.event_projection(event_emb)
 
+        compatibility_logits = None
+        prior_logits = None
+        text_time_gate = None
+        if self.time_conditioned_alignment is not None:
+            required_inputs = (
+                description_emb,
+                time_feat,
+                time_feat_weight,
+                domain_id,
+            )
+            if all(value is not None for value in required_inputs):
+                (
+                    compatibility_logits,
+                    prior_logits,
+                    text_time_gate,
+                ) = self.time_conditioned_alignment(
+                    ts_emb=ts_outputs.embeddings,
+                    text_emb=description_emb,
+                    time_feat=time_feat,
+                    time_feat_weight=time_feat_weight,
+                    domain_id=domain_id,
+                )
+
         classification = self.classification_head(ts_outputs.embeddings)
         return TimeseriesOutputs(
             input_mask=input_mask,
@@ -381,6 +431,9 @@ class MultiModalEncoder(nn.Module):
             channel_description_emb=channel_description_emb,
             event_emb=event_emb,
             prior_emb=ts_outputs.prior_emb,
+            compatibility_logits=compatibility_logits,
+            prior_logits=prior_logits,
+            text_time_gate=text_time_gate,
         )
 
     def get_ts_embedding(self, x_enc, input_mask=None, **kwargs):
